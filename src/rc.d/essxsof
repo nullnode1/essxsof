@@ -1,0 +1,18 @@
+#!/bin/sh
+# PROVIDE: essxsof
+# REQUIRE: FILESYSTEMS kld devmatch
+# BEFORE: mixer LOGIN
+# KEYWORD: shutdown
+# SPDX-License-Identifier: BSD-2-Clause
+. /etc/rc.subr
+name=essxsof
+rcvar=essxsof_enable
+start_cmd=essxsof_start
+stop_cmd=essxsof_stop
+status_cmd=essxsof_status
+essxsof_start() { /usr/local/sbin/essxsofctl start; }
+essxsof_stop() { /usr/local/sbin/essxsofctl stop; }
+essxsof_status() { /usr/local/sbin/essxsofctl status; }
+load_rc_config "$name"
+: "${essxsof_enable:=NO}"
+run_rc_command "$1"

@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
+"""Optional per-user PulseAudio software output for the essxsof driver."""
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+
+SINK = "essx_volume_200"
+FAST_SINK = "essx_oss_fast"
+DESCRIPTION = "Casper_ES8336_Software_200"
+VERSION = "0.2.0"
+PROFILE = "oss48k-virtual-v1"
+
+
+class Error(RuntimeError):
+    pass
+
+
+def physical_outputs(sinks):
+    """Coalesce PulseAudio aliases of one actual OSS /dev/dspN device."""
+    candidates = [s for s in sinks if s.get("name") != SINK and (
+        "Casper ES8336 SOF" in str(s.get("description", "")) or
+        "Casper ES8336 SOF" in str(s.get("properties", {}).get("device.description", "")))]
+    if not candidates:
+        raise Error("No Casper ES8336 SOF playback output; start essxsof first")
+    devices = {s.get("properties", {}).get("device.string") for s in candidates}
+    if len(devices) != 1:
+        raise Error("Multiple physical Casper devices; no output selected")
+    device = next(iter(devices))
+    if not isinstance(device, str) or not re.fullmatch(r"/dev/dsp[0-9]+", device):
+        raise Error("Cannot identify the physical OSS device; no output selected")
+    canonical = "oss_output." + device.rsplit("/", 1)[1]
+    # Do not unload duplicate OSS modules: they may also own capture sources.
+    ordered = sorted(candidates, key=lambda s: (s["name"] != canonical, int(s["index"])))
+    return ordered[0], ordered
+
+
+class Audio:
+    def __init__(self):
+        base = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
+        self.folder = base / "essx-volume"
+        self.statefile = self.folder / "state.json"
+        self.pref = self.folder / "volume.json"
+
+    def command(self, *args, optional=False):
+        result = subprocess.run(list(args), text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env={**os.environ, "LC_ALL": "C"})
+        if result.returncode and not optional:
+            raise Error(result.stderr.strip() or "Command failed: " + " ".join(args))
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    def pa(self, *args):
+        return self.command("pactl", *args)
+
+    def listing(self, what):
+        if what == "modules":
+            # PulseAudio 17's module JSON omits numeric module indices.
+            # The documented short TEXT form includes ID, name, arguments.
+            result = []
+            for line in self.pa("-f", "text", "list", "short", "modules").splitlines():
+                fields = line.split("\t", 3)
+                if len(fields) < 2 or not fields[0].isdigit() or not fields[1]:
+                    raise Error("Unexpected pactl module row; nothing unloaded")
+                result.append({"index": int(fields[0]), "name": fields[1],
+                               "argument": fields[2] if len(fields) > 2 else ""})
+            return result
+        result = json.loads(self.pa("-f", "json", "list", what))
+        if not isinstance(result, list):
+            raise Error("Unexpected pactl JSON response")
+        return result
+
+    def read(self):
+        return json.loads(self.statefile.read_text()) if self.statefile.exists() else None
+
+    def save(self, data):
+        tmp = self.statefile.with_suffix(".new")
+        tmp.write_text(json.dumps(data, indent=2) + "\n")
+        tmp.chmod(0o600)
+        tmp.replace(self.statefile)
+
+    def lookup(self, name):
+        return next((s for s in self.listing("sinks") if s["name"] == name), None)
+
+    def session(self, action):
+        master, aliases = physical_outputs(self.listing("sinks"))
+        if action == "pause":
+            for sink in aliases:
+                self.pa("suspend-sink", sink["name"], "1")
+            print("Casper playback paused for reinstall (" + str(len(aliases)) + " aliases).")
+        elif action == "resume":
+            self.pa("suspend-sink", master["name"], "0")
+            print("Casper playback resumed: " + master["name"])
+        else:
+            raise Error("Session action must be pause or resume")
+
+    def owns(self, state):
+        modules = {int(m["index"]): m for m in self.listing("modules")}
+        for entry in state.get("modules", []):
+            actual = modules.get(entry["id"])
+            if not actual or actual["name"] != entry["name"]:
+                return False
+            if shlex.split(actual.get("argument", "")) != entry["args"]:
+                return False
+        virtual = self.lookup(SINK)
+        entries = state.get("modules", [])
+        names = [e["name"] for e in entries]
+        if state.get("profile") == PROFILE and names == ["module-oss", "module-virtual-sink"]:
+            owner = entries[1]["id"]
+        elif names == ["module-null-sink", "module-loopback"]:
+            owner = entries[0]["id"]  # Accept the old state for safe migration.
+        else:
+            return False
+        return bool(virtual and int(virtual["owner_module"]) == owner)
+
+    def load(self, state, name, args):
+        index = int(self.pa("load-module", name, *args))
+        state["modules"].append({"id": index, "name": name, "args": args})
+        self.save(state)
+
+    def panel(self, state):
+        if not shutil.which("xfconf-query"):
+            return
+        paths = self.command("xfconf-query", "-c", "xfce4-panel", "-l", optional=True)
+        if paths is None:
+            return
+        for path in paths.splitlines():
+            if not re.fullmatch(r"/plugins/plugin-[0-9]+", path):
+                continue
+            kind = self.command("xfconf-query", "-c", "xfce4-panel", "-p", path, optional=True)
+            if kind != "pulseaudio":
+                continue
+            prop = path + "/volume-max"
+            previous = self.command("xfconf-query", "-c", "xfce4-panel", "-p", prop, optional=True)
+            if previous is not None and not previous.isdigit():
+                continue
+            record = {"path": prop, "old": previous}
+            state["panel"].append(record)
+            self.save(state)
+            args = ["xfconf-query", "-c", "xfce4-panel", "-p", prop]
+            if previous is None:
+                args += ["-n", "-t", "int"]
+            self.command(*args, "-s", "200")
+
+    def restore(self, state):
+        # Never reuse a saved numeric module ID after a PulseAudio restart.
+        modules = {int(m["index"]): m for m in self.listing("modules")}
+        virtual = self.lookup(SINK)
+        master = self.lookup(state["master"])
+        control = self.lookup(state.get("control", state["master"]))
+        owned = {e["id"] for e in state["modules"]
+                 if e["id"] in modules and modules[e["id"]]["name"] == e["name"] and
+                 shlex.split(modules[e["id"]].get("argument", "")) == e["args"]}
+        if virtual and int(virtual["owner_module"]) not in owned:
+            raise Error("Virtual output ownership changed; state preserved, nothing unloaded")
+        if owned and control:
+            # Restore the physical level before moving applications back.
+            # Respect later manual changes to that physical output.
+            values = [int(v["value"]) for v in control.get("volume", {}).values()]
+            if values and all(abs(v - 65536) <= 1 for v in values):
+                self.pa("set-sink-volume", control["name"], *[str(v) for v in state["old_volume"]])
+            if not control.get("mute", False):
+                self.pa("set-sink-mute", control["name"], "1" if state["old_mute"] else "0")
+        if virtual and int(virtual["owner_module"]) in owned:
+            # Move only application streams on our output. The loopback stream
+            # is locked to the physical device and must never be moved here.
+            if master:
+                for stream in self.listing("sink-inputs"):
+                    if int(stream["sink"]) == int(virtual["index"]):
+                        target = state.get("moved_streams", {}).get(str(stream["index"]), state["master"])
+                        if not self.lookup(target):
+                            target = state["master"]
+                        self.pa("move-sink-input", str(stream["index"]), target)
+            if self.pa("get-default-sink") == SINK:
+                target = state["old_default"] if self.lookup(state["old_default"]) else state["master"]
+                if self.lookup(target):
+                    self.pa("set-default-sink", target)
+        for entry in reversed(state["modules"]):
+            if entry["id"] in owned:
+                self.pa("unload-module", str(entry["id"]))
+        if shutil.which("xfconf-query"):
+            for record in state.get("panel", []):
+                args = ["xfconf-query", "-c", "xfce4-panel", "-p", record["path"]]
+                current = self.command(*args, optional=True)
+                if current == "200":
+                    if record["old"] is None:
+                        self.command(*args, "-r")
+                    else:
+                        self.command(*args, "-s", record["old"])
+        self.statefile.unlink(missing_ok=True)
+
+    def start(self):
+        state = self.read()
+        if state and self.owns(state) and state.get("profile") == PROFILE:
+            self.set_volume(100)
+            print("Already active; startup volume reset to 100%.")
+            return
+        if state:
+            self.restore(state)
+        if self.lookup(SINK) or self.lookup(FAST_SINK):
+            raise Error("An unmanaged output already uses an essx output name")
+        master, aliases = physical_outputs(self.listing("sinks"))
+        physical_indices = {int(s["index"]): s["name"] for s in aliases}
+        volume = [int(v["value"]) for v in master.get("volume", {}).values()]
+        if not volume:
+            raise Error("Cannot snapshot physical output volume")
+        # Startup is always unity, including when an old helper saved 200%.
+        # Manual 0..200 changes apply only until the next start/login.
+        selected = 100
+        state = dict(master=master["name"], old_default=self.pa("get-default-sink"),
+                     old_volume=volume, old_mute=bool(master.get("mute", False)),
+                     modules=[], panel=[], moved_streams={}, profile=PROFILE, control=FAST_SINK)
+        self.save(state)
+        try:
+            # Playback-only backend: no microphone source or global daemon
+            # settings change. OSS may round/raise the requested buffer size.
+            self.load(state, "module-oss", ["sink_name=" + FAST_SINK,
+                      "device=" + master["properties"]["device.string"],
+                      "record=no", "playback=yes", "rate=48000", "format=s16le",
+                      "channels=2", "fragments=4", "fragment_size=2048", "mmap=no"])
+            # Direct software volume in the master's clock domain. Explicitly
+            # disable volume sharing to retain real >100% software gain.
+            self.load(state, "module-virtual-sink", ["sink_name=" + SINK,
+                      "master=" + FAST_SINK, "rate=48000", "channels=2",
+                      "channel_map=front-left,front-right", "use_volume_sharing=no",
+                      "force_flat_volume=no", "sink_properties=device.description=" + DESCRIPTION])
+            self.pa("set-sink-volume", SINK, str(selected) + "%")
+            self.pa("set-sink-mute", SINK, "1" if state["old_mute"] else "0")
+            self.pa("set-sink-volume", FAST_SINK, "100%")
+            self.pa("set-sink-mute", FAST_SINK, "0")
+            self.panel(state)
+            self.pa("set-default-sink", SINK)
+            for stream in self.listing("sink-inputs"):
+                if (int(stream["sink"]) in physical_indices and
+                        str(stream.get("owner_module")) not in [str(e["id"]) for e in state["modules"]]):
+                    state["moved_streams"][str(stream["index"])] = physical_indices[int(stream["sink"])]
+                    self.save(state)
+                    self.pa("move-sink-input", str(stream["index"]), SINK)
+        except Exception:
+            try:
+                self.restore(state)
+            except Exception as cleanup:
+                print("Rollback incomplete; run stop again: " + str(cleanup), file=sys.stderr)
+            raise
+        print("Active: direct virtual sink / OSS 48k; volume=" + str(selected) + "% (0..200).")
+
+    def set_volume(self, value):
+        if not 0 <= value <= 200:
+            raise Error("Volume must be 0..200")
+        state = self.read()
+        if not state or not self.owns(state):
+            raise Error("Software output is inactive; run start first")
+        self.pa("set-sink-volume", SINK, str(value) + "%")
+        tmp = self.pref.with_suffix(".new")
+        # Keep legacy helpers from restoring a previously boosted level too.
+        tmp.write_text(json.dumps({"percent": 100}) + "\n")
+        tmp.chmod(0o600)
+        tmp.replace(self.pref)
+        print("Software volume: " + str(value) + "%")
+
+    def status(self):
+        state = self.read()
+        if not state or not self.owns(state):
+            raise Error("Software output is inactive")
+        print("Physical output:", state["master"])
+        print("Profile:", state.get("profile", "legacy-null-loopback"))
+        print("Desktop output:", SINK)
+        print(self.pa("get-sink-volume", SINK))
+
+    def report(self):
+        # Pulse's reported latency is telemetry, not an acoustic measurement.
+        sinks = self.listing("sinks")
+        selected = [s for s in sinks if s.get("name") in (SINK, FAST_SINK) or
+                    "Casper ES8336 SOF" in str(s.get("description", ""))]
+        indices = {int(s["index"]) for s in selected}
+        streams = [s for s in self.listing("sink-inputs") if int(s["sink"]) in indices]
+        state = self.read()
+        print(json.dumps({"helper_version": VERSION,
+                          "profile": state.get("profile", "legacy-null-loopback") if state else "inactive",
+                          "default_sink": self.pa("get-default-sink"),
+                          "sinks": selected, "playback_streams": streams}, indent=2))
+
+
+def install():
+    destination = Path.home() / ".local/bin/essx-volume"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if Path(__file__).resolve() != destination.resolve():
+        if destination.exists() and "Optional per-user PulseAudio software output" not in destination.read_text():
+            raise Error("Refusing to overwrite an unmanaged " + str(destination))
+        shutil.copyfile(__file__, destination)
+    destination.chmod(0o755)
+    startup = Path.home() / ".config/autostart/essx-volume.desktop"
+    startup.parent.mkdir(parents=True, exist_ok=True)
+    if startup.exists() and "X-Essx-Volume=true" not in startup.read_text():
+        raise Error("Refusing to replace unmanaged autostart entry")
+    def quote(value):
+        if any(c in str(value) for c in '\n\r'):
+            raise Error("Unsupported newline in install path")
+        escaped = str(value).replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$').replace('%', '%%')
+        return '"' + escaped + '"'
+    startup.write_text('[Desktop Entry]\nType=Application\nName=ES8336 software volume\n'
+                       'Exec=' + quote(sys.executable) + ' ' + quote(destination) + ' start --wait\n'
+                       'Terminal=false\nX-Essx-Volume=true\n')
+    print("Installed:", destination)
+    print("Enabled per-user desktop autostart. No kernel or rc.d changes.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version="essx-volume " + VERSION)
+    parser.add_argument("action", choices=["install", "start", "stop", "set", "status", "report", "remove"])
+    parser.add_argument("percent", type=int, nargs="?")
+    parser.add_argument("--wait", action="store_true")
+    args = parser.parse_args()
+    if os.geteuid() == 0:
+        raise Error("Run as the desktop user, not su/root")
+    if args.action == "install":
+        install()
+        return
+    audio = Audio()
+    if audio.folder.is_symlink():
+        raise Error("State directory must not be a symlink")
+    audio.folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    audio.folder.chmod(0o700)
+    with (audio.folder / "lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if args.action == "start":
+            attempts = 30 if args.wait else 1
+            for n in range(attempts):
+                try:
+                    audio.start()
+                    break
+                except (Error, subprocess.SubprocessError):
+                    if n + 1 == attempts:
+                        raise
+                    time.sleep(1)
+        elif args.action in ("stop", "remove"):
+            state = audio.read()
+            if state:
+                audio.restore(state)
+            if args.action == "remove":
+                startup = Path.home() / ".config/autostart/essx-volume.desktop"
+                if startup.exists() and "X-Essx-Volume=true" in startup.read_text():
+                    startup.unlink()
+                destination = Path.home() / ".local/bin/essx-volume"
+                if destination.exists() and "Optional per-user PulseAudio software output" in destination.read_text():
+                    destination.unlink()
+            print("Software output stopped; normal driver remains active.")
+        elif args.action == "set":
+            if args.percent is None:
+                raise Error("Usage: essx-volume set 0..200")
+            audio.set_volume(args.percent)
+        elif args.action == "report":
+            audio.report()
+        else:
+            audio.status()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (Error, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+        print("essx-volume: " + str(exc), file=sys.stderr)
+        sys.exit(1)

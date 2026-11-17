@@ -1,0 +1,19 @@
+ESSXSOF license summary
+
+The combined native essxsof.ko module includes a GPL-2.0-only codec
+component and is distributed under GPL-2.0-only terms with complete
+corresponding source. Keep the original BSD notices for the other files.
+
+- New host glue, desktop helper and installer scripts: BSD-2-Clause.
+- SOF IPC code/headers marked BSD-3-Clause: original notices apply.
+- src/essx_codec.c: GPL-2.0-only; Linux ES8316/ES8336 references credited
+  in the source file.
+- Intel-signed src/firmware/sof-tgl.ri: separate Intel/SOF terms.
+
+Full terms and upstream notices are included in licenses/, src/vendor/
+and src/firmware/LICENCE.Intel. They are not replaced by this summary.
+The DSP firmware was not written by this project. AI assistance and
+upstream references were used in development; hardware testing and project
+maintenance: Gorkem Caliskan (Görkem Çalışkan).
+
+No warranty or upstream/vendor endorsement is provided.

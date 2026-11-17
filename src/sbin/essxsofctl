@@ -1,0 +1,174 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+set -eu
+export LC_ALL=C
+version=0.19.0-rc1
+root=${ESSXSOF_ROOT:-}
+share="$root/usr/local/share/essxsof"
+state="$root/var/run/essxsof"
+mod="$root/boot/modules"
+config="$root/usr/local/etc/essxsof.conf"
+die() { echo "essxsof: $*" >&2; exit 1; }
+owner() { pciconf -l pci0:0:31:3 | cut -d @ -f 1; }
+unit() { sysctl -a | awk '$1 ~ /^dev\.pcm\.[0-9]+\.%parent:$/ && $2=="essxsof0" {split($1,a,"."); print a[3]; exit}'; }
+get() { sysctl -n "$1" 2>/dev/null; }
+load_config() {
+    essxsof_gpio=1
+    essxsof_dac_attenuation=0
+    essxsof_master=25
+    essxsof_pcm=100
+    essxsof_set_default=YES
+    if [ -f "$config" ]; then . "$config"; fi
+    case "$essxsof_gpio" in 0|1) ;; *) die 'gpio must be 0 or 1';; esac
+    for value in "$essxsof_dac_attenuation" "$essxsof_master" "$essxsof_pcm"; do
+        case "$value" in ''|*[!0-9]*) die 'volume settings must be nonnegative integers';; esac
+    done
+    [ "$essxsof_dac_attenuation" -le 48 ] || die 'dac_attenuation must be 0..48 dB'
+    [ "$essxsof_master" -le 100 ] && [ "$essxsof_pcm" -le 100 ] || die 'master/pcm must be 0..100'
+    case "$essxsof_set_default" in YES|NO) ;; *) die 'set_default must be YES or NO';; esac
+}
+preflight() {
+    [ "$(uname -s)" = FreeBSD ] && [ "$(uname -m)" = amd64 ] || die 'FreeBSD amd64 required'
+    [ -f "$share/build-info" ] || die 'build-info missing; reinstall the package'
+    built=$(awk -F= '$1=="kernel_osreldate" {print $2}' "$share/build-info")
+    release=$(awk -F= '$1=="driver_version" {print $2}' "$share/build-info")
+    [ "$release" = "$version" ] || die 'incomplete/version-mismatched installation; reinstall'
+    [ "$built" = "$(get kern.osreldate)" ] || die 'kernel ABI changed; rebuild against matching /usr/src and reinstall'
+    [ -r "$mod/essxsof.ko" ] && [ -r "$mod/essx8336_sof.ko" ] || die 'installed kernel modules missing'
+    for pair in driver_sha256:essxsof.ko firmware_module_sha256:essx8336_sof.ko; do
+        key=${pair%%:*}; file=${pair#*:}
+        expected=$(awk -F= -v k="$key" '$1==k {print $2}' "$share/build-info")
+        [ "$(sha256 -q "$mod/$file")" = "$expected" ] || die "module checksum mismatch: $file; reinstall"
+    done
+}
+disable_old_hints() {
+    for flag in fw_test rom_test dma_stage dsp_power_test dsp_snapshot; do
+        kenv "hint.hdac.0.essx8336_$flag=0" >/dev/null || return 1
+    done
+}
+restore_default() {
+    if [ -f "$state/default_unit" ]; then
+        old=$(cat "$state/default_unit")
+        case "$old" in ''|*[!0-9]*) ;; *)
+            if get "dev.pcm.$old.%desc" >/dev/null; then
+                sysctl "hw.snd.default_unit=$old" >/dev/null || return 1
+            fi;;
+        esac
+    fi
+}
+stop_driver() {
+    current=$(owner)
+    clear=NO
+    case "$current" in
+        essxsof*)
+            devctl detach pci0:0:31:3 || { echo 'Detach refused; resources retained. Do not force unload.' >&2; return 1; }
+            clear=YES;;
+        none*) [ ! -f "$state/default_unit" ] || clear=YES;;
+        hdac*) ;;
+        *) echo "Unexpected PCI owner: $current; stopped without forcing." >&2; return 1;;
+    esac
+    if kldstat -q -n essxsof.ko; then kldunload essxsof || return 1; fi
+    if [ "$clear" = YES ]; then
+        disable_old_hints || return 1
+        devctl clear driver pci0:0:31:3 || return 1
+    fi
+    if kldstat -q -n essx8336_sof.ko; then kldunload essx8336_sof || return 1; fi
+    restore_default || return 1
+    rm -f "$state/default_unit"
+    echo 'essxsof stopped; normal PCI driver restored.'
+}
+start_driver() {
+    load_config
+    preflight
+    current=$(owner)
+    case "$current" in hdac*|none*|essxsof*) ;; *) die "unexpected PCI owner: $current";; esac
+    if kldstat -q -n essxsof.ko; then
+        [ "$(get dev.essxsof.0.driver_version || :)" = "$version" ] || die 'another driver revision is loaded; stop it with its own rollback script first'
+        if [ "$(get dev.essxsof.0.pcm_enable || :)" = 1 ]; then
+            echo 'essxsof already active; mixer levels preserved.'
+            return 0
+        fi
+    fi
+    if kldstat -q -n essxdiag.ko; then die 'old essxdiag module loaded; close the old diagnostic first'; fi
+    if [ ! -f "$state/default_unit" ]; then
+        old=$(get hw.snd.default_unit || echo -1)
+        (umask 077; printf '%s\n' "$old" > "$state/default_unit")
+    fi
+    trap 'result=$?; trap - 0; if [ "$result" -ne 0 ]; then stop_driver || echo "Rollback incomplete; send essxsofctl report. Do not force unload." >&2; fi; exit "$result"' 0
+    disable_old_hints
+    if ! kldstat -q -n essx8336_sof.ko; then kldload "$mod/essx8336_sof.ko"; fi
+    if ! kldstat -q -n essxsof.ko; then kldload "$mod/essxsof.ko"; fi
+    if ! get dev.essxsof.0.pcm_enable >/dev/null; then
+        case "$(owner)" in
+            hdac*) devctl detach pci0:0:31:3;;
+            none*) ;;
+            *) die 'PCI ownership changed during startup';;
+        esac
+        devctl set driver pci0:0:31:3 essxsof
+    fi
+    [ "$(get dev.essxsof.0.driver_version)" = "$version" ] || die 'loaded driver version mismatch'
+    get dev.essxcodec.0.%desc >/dev/null || die 'ES8336 I2C codec did not attach'
+    number=$(unit)
+    case "$number" in ''|*[!0-9]*) die 'PCM child missing';; esac
+    attenuation=$(awk -v n="$essxsof_dac_attenuation" 'BEGIN {printf "%d",n}')
+    sysctl "dev.essxsof.0.amp_gpio=$essxsof_gpio" >/dev/null
+    sysctl "dev.essxsof.0.dac_attenuation=$attenuation" >/dev/null
+    # Apply software levels before firmware startup can fulfill an early
+    # desktop START request; the new DAC range must use the chosen volume.
+    master=$(awk -v n="$essxsof_master" 'BEGIN {printf "%.2f",n/100}')
+    pcm=$(awk -v n="$essxsof_pcm" 'BEGIN {printf "%.2f",n/100}')
+    mixer -f "/dev/mixer$number" "vol.volume=$master" "pcm.volume=$pcm" vol.mute=off pcm.mute=off >/dev/null
+    sysctl dev.essxsof.0.pcm_enable=1 >/dev/null
+    if [ "$essxsof_set_default" = YES ]; then sysctl "hw.snd.default_unit=$number" >/dev/null; fi
+    trap - 0
+    echo "essxsof $version active: /dev/dsp$number, /dev/mixer$number, GPIO=$essxsof_gpio, DAC attenuation=${attenuation}dB"
+}
+status_driver() {
+    echo "PCI owner: $(owner)"
+    if [ "$(get dev.essxsof.0.pcm_enable || :)" = 1 ]; then
+        sysctl dev.essxsof.0.driver_version dev.essxsof.0.amp_gpio dev.essxsof.0.dac_attenuation
+        number=$(unit)
+        echo "PCM: /dev/dsp$number"
+        if [ -n "$number" ]; then
+            sysctl "dev.pcm.$number.essx_fault"
+            [ "$(get "dev.pcm.$number.essx_fault")" = 0 ] || return 2
+        fi
+        return 0
+    fi
+    echo 'essxsof playback is inactive.'
+    return 1
+}
+report_driver() {
+    echo "essxsof control package $version"
+    uname -a
+    sysctl kern.bootfile kern.osreldate hw.snd.default_unit
+    pciconf -lvb pci0:0:31:3
+    cat /dev/sndstat
+    sysctl -a | awk '$1 ~ /^dev\.essxsof\.0\./ || $1 ~ /^dev\.pcm\.[0-9]+\.essx_/ {print}'
+    number=$(unit)
+    if [ -n "$number" ]; then mixer -f "/dev/mixer$number"; fi
+    dmesg | grep -E '^(essxsof|essxcodec|pcm)[0-9]+:' | tail -n 100 || :
+}
+action=${1:-status}
+case "$action" in
+    start|stop|restart|_start|_stop|_restart|enable|disable)
+        [ "$(id -u)" -eq 0 ] || die 'root required';;
+esac
+case "$action" in
+    start|stop|restart)
+        [ ! -L "$state" ] || die 'state directory must not be a symlink'
+        install -d -m 700 "$state"
+        exec lockf -t 0 "$root/var/run/essxsof.lock" "$0" "_$action";;
+    _start) start_driver;;
+    _stop) stop_driver;;
+    _restart) stop_driver; start_driver;;
+    status) status_driver;;
+    report) report_driver;;
+    test)
+        [ "$(get dev.essxsof.0.pcm_enable || :)" = 1 ] || die 'start the service first'
+        number=$(unit);[ -n "$number" ] || die 'PCM child missing'
+        exec "$root/usr/local/libexec/essxsof/pcm-test" "/dev/dsp$number";;
+    enable) sysrc essxsof_enable=YES;;
+    disable) sysrc essxsof_enable=NO;;
+    *) die 'usage: essxsofctl start|stop|restart|status|test|report|enable|disable';;
+esac

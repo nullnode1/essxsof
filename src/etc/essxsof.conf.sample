@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# Read by /usr/local/sbin/essxsofctl. Root-owned shell configuration.
+# Hardware validated on Casper Nirvana NB F500 / TN1 001 only.
+essxsof_gpio=1
+# 0 dB = normal DAC range, 12 dB = previous v0.18.x working setting.
+# Allowed 0..48 dB attenuation. Change, then close players and restart service.
+essxsof_dac_attenuation=0
+# Initial software mixer percentages. FreeBSD mixer service may restore
+# saved mixer settings later at boot; normal volume keys remain available.
+essxsof_master=25
+essxsof_pcm=100
+essxsof_set_default=YES
