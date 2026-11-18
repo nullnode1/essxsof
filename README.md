@@ -213,8 +213,3 @@ The installer treats this **optional cosmetic cleanup** as a warning rather
 than marking an otherwise working audio installation as failed. The physical
 kernel driver and routing logic are not changed. Do not disable `module-devd-detect`
 or unload other system sound modules to hide these entries.
-
-## Publishing on GitHub
-
-See `GITHUB_RELEASE.md` for a release description, Git commands, known limitations
-and a checklist. Do not state universal ES8336 hardware compatibility.
