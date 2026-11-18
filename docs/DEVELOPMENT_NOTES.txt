@@ -1,0 +1,72 @@
+ESSXSOF - DEVELOPMENT AND VALIDATION RECORD (1.0.0)
+=================================================
+Project repository: https://github.com/nullnode1/essxsof
+This document summarizes supplied local hardware reports and shipped code.
+It is not a universal compatibility or certification statement.
+
+KNOWN TEST BOARD
+----------------
+Casper Nirvana NB F500 / TN1 001; FreeBSD 15.1-RELEASE amd64;
+Intel Tiger Lake audio 8086:a0c8, subsystem 1e50:6004;
+Everest ES8336 at ACPI ESSX8336 / I2C 0x11.
+
+WHAT WAS OBSERVED
+-----------------
+- Native 0.20.0-rc1 speaker output and analog headphone output worked.
+- Several repeated headphone insertion/removal transitions selected the
+  expected playback route and muted the internal speaker.
+- Real logs showed jack flags 0x22 -> speaker output_mode 0;
+  flags 0x20 -> headphone output_mode 1 for this board.
+- RC2 booted with a headphone plugged in; kernel playback and jack monitor
+  automatically initialized, with a 0 PCM fault counter.
+- RC5 status accurately showed monitor running for root and gave a
+  qualified status for an ordinary user without reading root-only PID files.
+- RC5 audio remained active after the optional PulseAudio module cleanup
+  reported a changed candidate and stopped the installer.
+- The 1.0.0 cleanup race fix was checked by offline tests and has NOT yet
+  been tested on the physical machine. It should pass a final install test
+  before being announced as hardware-validated Stable.
+
+WHY THE VERSION STRING IS DIFFERENT
+-----------------------------------
+1.0.0 is the DISTRIBUTION version (installer, desktop, sources and docs).
+0.20.0-rc1 is the unchanged native KERNEL driver string; preserving it
+avoids modifying the kernel code that worked in the hardware trials.
+
+INSTALL / VERIFY
+----------------
+Run from extracted directory as the regular desktop user:
+  sh install.sh
+  sh diagnose.sh
+  essxsofctl status
+  ~/.local/bin/essx-desktop status
+  pactl list short sinks
+  sysctl dev.pcm.0.essx_fault
+Test with headset unplugged and plugged, after reboot and login.
+Verify no simultaneous headphone/speaker sound; repeat transitions.
+Check microphone input sources remain listed. Test continuous playback.
+
+ROOT SERVICE / DESKTOP DISTINCTION
+----------------------------------
+Native root side: PCI ownership, MMIO/DMA, SOF firmware, I2C register writes,
+GPIO174 amp, GPIO173 jack IRQ and physical output_mode.
+Per-user side: virtual PulseAudio output profiles, saved software volumes,
+OSS backend creation and duplicate cleanup. Do not run per-user pactl under
+root as it may connect to the wrong/no PulseAudio socket.
+
+SAFETY RULES
+------------
+- Do not run arbitrary codec register writes on unknown machines.
+- Do not infer microphone recording from mic-bias detection.
+- Do not force-unload a kernel module when safe stop fails.
+- Do not change root-only PID permissions simply to improve a status display.
+- Do not delete/overwrite an existing GitHub repository history to publish.
+- Preserve GPL/BSD/SOF/Intel notices when redistributing sources/firmware.
+
+WHERE TO READ MORE
+------------------
+README.md: features, requirements, install, uninstall, acceptance.
+TESTING.md: acceptance tests.
+docs/HARDWARE_REGISTERS.md: exact codec registers, masks, GPIO routing.
+docs/DRIVER_INTERNALS.md: Intel HDA/SOF/IPC3/PCM data-flow and stages.
+TECHNICAL_INFO.txt: portable plaintext register quick reference.

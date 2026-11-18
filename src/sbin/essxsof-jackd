@@ -1,0 +1,212 @@
+#!/usr/local/bin/python3
+# SPDX-License-Identifier: BSD-2-Clause
+"""Root headphone/speaker monitor for the tested Casper ES8336 board.
+
+Started by essxsofctl only when essxsof_jack_auto=YES. Native codec, GPIO,
+mute and route control stay in essxsof.ko; this process only decides WHEN
+to ask for a route. Policy is the exact pair measured on the test laptop:
+
+    codec 0x4f == 0x22 (mic-ground not shorted) -> output_mode=0 speakers
+    codec 0x4f == 0x20 (mic-ground shorted)     -> output_mode=1 headphones
+
+Three consecutive identical readings are needed before a change. Other
+values never select speakers; they only reset confirmation, and a long run
+of them ends the monitor.
+"""
+import os
+import signal
+import subprocess
+import sys
+import threading
+
+VERSION = '0.20.0-rc1'
+PREFIX = 'dev.essxsof.0.'
+KNOWN = {0x20: 1, 0x22: 0}          # raw jack flags -> output_mode
+SPEAKERS, HEADPHONES = 0, 1
+
+
+class JackError(Exception):
+    pass
+
+
+class Policy:
+    def __init__(self, confirmations=3):
+        if confirmations < 2:
+            raise ValueError('at least two confirmations required')
+        self.confirmations = confirmations
+        self.candidate = None
+        self.count = 0
+        self.applied = None
+
+    def prime(self, raw):
+        """Initial stable reading counts as already confirmed."""
+        self.candidate = KNOWN[raw]
+        self.count = self.confirmations
+        return self.candidate
+
+    def reset(self):
+        self.candidate, self.count = None, 0
+
+    def observe(self, raw):
+        if raw not in KNOWN:
+            raise ValueError('unexpected codec jack flags: ' + str(raw))
+        target = KNOWN[raw]
+        if target != self.candidate:
+            self.candidate, self.count = target, 1
+        else:
+            self.count += 1
+        if self.count >= self.confirmations and target != self.applied:
+            return target
+        return None
+
+    def commit(self, target):
+        if target != self.candidate or self.count < self.confirmations:
+            raise ValueError('route was not confirmed')
+        self.applied = target
+
+
+class Sysctl:
+    """Thin wrapper around sysctl(8); replaced by a fake in the tests."""
+
+    def get(self, name):
+        try:
+            result = subprocess.run(['sysctl', '-n', PREFIX + name], text=True,
+                                    capture_output=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise JackError('sysctl ' + name + ': ' + str(exc))
+        if result.returncode:
+            raise JackError('sysctl ' + name + ': ' + result.stderr.strip())
+        return result.stdout.strip()
+
+    def set(self, name, value):
+        try:
+            result = subprocess.run(['sysctl', PREFIX + name + '=' + str(value)],
+                                    text=True, capture_output=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise JackError('sysctl ' + name + '=' + str(value) + ': ' + str(exc))
+        if result.returncode:
+            raise JackError('sysctl ' + name + '=' + str(value) + ': ' + result.stderr.strip())
+
+
+class Jackd:
+    # (sysctl, enable value, undo value); undo runs in reverse order.
+    SETUP = [('jack_poll_prepare', '1', None),
+             ('jack_detect_enable', '1', '0'),
+             ('jack_micbias_trial', '1', '0')]
+
+    def __init__(self, ctl, wait, log=print, interval=0.2, confirmations=3,
+                 settle=0.5, samples=6, sample_gap=0.12, max_bad=50):
+        self.ctl, self.wait, self.log = ctl, wait, log
+        self.interval, self.settle = interval, settle
+        self.samples, self.sample_gap, self.max_bad = samples, sample_gap, max_bad
+        self.policy = Policy(confirmations)
+        self.undo = []
+
+    # wait(seconds) -> True when a stop was requested
+    def check_preconditions(self):
+        version = self.ctl.get('driver_version')
+        if version != VERSION:
+            raise JackError('driver version ' + version + ' != ' + VERSION)
+        if self.ctl.get('pcm_enable') != '1':
+            raise JackError('playback is not enabled')
+        for name in ('jack_detect_enable', 'jack_micbias_trial', 'jack_bias_playback'):
+            if self.ctl.get(name) != '0':
+                raise JackError(name + ' is already on; another test owns the jack')
+
+    def read_flags(self):
+        try:
+            return int(self.ctl.get('jack_flags'))
+        except ValueError:
+            raise JackError('jack_flags is not a number')
+
+    def initial_state(self):
+        if self.wait(self.settle):
+            raise JackError('stop requested during setup')
+        values = []
+        for _ in range(self.samples):
+            values.append(self.read_flags())
+            if self.wait(self.sample_gap):
+                raise JackError('stop requested during setup')
+        if len(set(values)) != 1 or values[0] not in KNOWN:
+            raise JackError('initial jack readings unstable or unknown: ' + repr(values))
+        return values[0]
+
+    def setup(self):
+        self.check_preconditions()
+        for name, value, undo in self.SETUP:
+            self.ctl.set(name, value)
+            if undo is not None:
+                self.undo.append((name, undo))
+        raw = self.initial_state()
+        target = self.policy.prime(raw)
+        # Admission unmutes the DAC in the current route; switch immediately.
+        self.ctl.set('jack_bias_playback', '1')
+        self.undo.append(('jack_bias_playback', '0'))
+        self.ctl.set('output_mode', str(target))
+        self.policy.commit(target)
+        self.log('jack monitor active: flags=0x%02x output_mode=%d' % (raw, target))
+
+    def teardown(self):
+        errors = []
+        while self.undo:
+            name, value = self.undo.pop()
+            try:
+                self.ctl.set(name, value)
+            except JackError as exc:
+                errors.append(str(exc))
+        return errors
+
+    def run(self):
+        bad = 0
+        while True:
+            try:
+                raw = self.read_flags()
+            except JackError as exc:
+                raw, reason = None, str(exc)
+            else:
+                reason = 'unexpected jack flags 0x%02x' % raw
+            if raw in KNOWN:
+                bad = 0
+                target = self.policy.observe(raw)
+                if target is not None:
+                    self.ctl.set('output_mode', str(target))
+                    self.policy.commit(target)
+                    self.log('route: flags=0x%02x output_mode=%d' % (raw, target))
+            else:
+                if bad == 0:
+                    self.log('warning: ' + reason + '; route unchanged')
+                bad += 1
+                self.policy.reset()
+                if bad >= self.max_bad:
+                    raise JackError('jack status unusable for ' + str(bad) + ' reads: ' + reason)
+            if self.wait(self.interval):
+                return
+
+
+def main():
+    if os.geteuid() != 0 or not sys.platform.startswith('freebsd'):
+        sys.exit('essxsof-jackd: FreeBSD root only; use essxsofctl.')
+    stop = threading.Event()
+    for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(number, lambda *_: stop.set())
+    jackd = Jackd(Sysctl(), lambda seconds: stop.wait(seconds),
+                  log=lambda text: print(text, flush=True))
+    failure = None
+    try:
+        jackd.setup()
+        jackd.run()
+    except (JackError, ValueError) as exc:
+        failure = str(exc)
+    # Revoke playback admission first, then bias/detection (kernel enforces it).
+    errors = jackd.teardown()
+    if errors:
+        print('cleanup incomplete; essxsofctl stop will roll the codec back: '
+              + '; '.join(errors), flush=True)
+    real_failure = failure is not None and 'stop requested' not in failure
+    if real_failure:
+        print('essxsof-jackd stopped: ' + failure + '; route left unchanged', flush=True)
+    sys.exit(1 if (real_failure or errors) else 0)
+
+
+if __name__ == '__main__':
+    main()

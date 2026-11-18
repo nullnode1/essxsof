@@ -463,7 +463,9 @@ pcm_hardware_start(struct essx_softc *sc)
     pause("essxverify",MAX(1,hz/50));
     error=essx_pcm_position(sc,&last);if(error)goto failed;
     if(last==first) {error=EIO;goto failed;}
-    sc->stage="codec-output";error=essx_codec_output(sc->amp_gpio);if(error)goto failed;
+    sc->stage="codec-output";
+    error=essx_codec_route(sc->amp_gpio,sc->dac_attenuation,sc->output_mode);
+    if(error)goto failed;
     sc->phase=4;sc->pcm_enabled=true;
     error=essx_pcm_arm(sc->pcm_child,true);if(error)goto failed;
     device_printf(sc->dev,"PCM enabled: 48k stereo GPIO174=%d DMA=%u->%u; idle ring is silence\n",
@@ -528,13 +530,133 @@ attenuation_sysctl(SYSCTL_HANDLER_ARGS)
     sx_xunlock(&sc->lock);return(error);
 }
 static int
+output_mode_sysctl(SYSCTL_HANDLER_ARGS)
+{
+    struct essx_softc *sc=arg1;
+    int value,error;
+    sx_xlock(&sc->lock);value=sc->output_mode;sx_xunlock(&sc->lock);
+    error=sysctl_handle_int(oidp,&value,0,req);
+    if(error||!req->newptr)return(error);
+    if(value<0||value>2)return(EINVAL);
+    error=priv_check(req->td,PRIV_DRIVER);if(error)return(error);
+    sx_xlock(&sc->lock);
+    if(sc->detaching)error=ENXIO;
+    else if(!sc->pcm_enabled||sc->poisoned)error=EBUSY;
+    else {
+        error=essx_codec_route(sc->amp_gpio,sc->dac_attenuation,value);
+        if(!error)sc->output_mode=value;
+    }
+    sc->last_error=error;
+    sx_xunlock(&sc->lock);return(error);
+}
+
+static int
+jack_status_sysctl(SYSCTL_HANDLER_ARGS)
+{
+    struct essx_softc *sc=arg1;
+    int value=0,error;
+    sx_xlock(&sc->lock);
+    if(sc->detaching||!sc->pcm_enabled)error=ENXIO;
+    else error=arg2?essx_codec_jack_pin(&value):essx_codec_jack_flags(&value);
+    sx_xunlock(&sc->lock);
+    if(error)return(error);
+    return(sysctl_handle_int(oidp,&value,0,req));
+}
+
+static int
+jack_poll_prepare_sysctl(SYSCTL_HANDLER_ARGS)
+{
+    struct essx_softc *sc=arg1;
+    int value=0,error=sysctl_handle_int(oidp,&value,0,req);
+    if(error||!req->newptr)return(error);
+    if(value!=1)return(EINVAL);
+    error=priv_check(req->td,PRIV_DRIVER);if(error)return(error);
+    sx_xlock(&sc->lock);
+    if(sc->detaching||!sc->pcm_enabled||sc->poisoned)error=EBUSY;
+    else error=essx_codec_jack_poll_prepare();
+    sx_xunlock(&sc->lock);return(error);
+}
+
+static int
+codec_snapshot_sysctl(SYSCTL_HANDLER_ARGS)
+{
+    struct essx_softc *sc=arg1;
+    char text[256];
+    int error;
+    sx_xlock(&sc->lock);
+    if(sc->detaching||!sc->pcm_enabled)error=ENXIO;
+    else error=essx_codec_snapshot(text,sizeof(text));
+    sx_xunlock(&sc->lock);
+    if(error)return(error);
+    return(sysctl_handle_string(oidp,text,sizeof(text),req));
+}
+
+static int
+jack_gpio_sysctl(SYSCTL_HANDLER_ARGS)
+{
+    struct essx_softc *sc=arg1;
+    char text[256];
+    int error;
+    sx_xlock(&sc->lock);
+    error=sc->detaching?ENXIO:essx_jack_gpio_snapshot(text,sizeof(text));
+    sx_xunlock(&sc->lock);
+    if(error)return(error);
+    return(sysctl_handle_string(oidp,text,sizeof(text),req));
+}
+
+static int
+jack_detect_sysctl(SYSCTL_HANDLER_ARGS)
+{
+    struct essx_softc *sc=arg1;
+    int value=essx_codec_jack_detect_state();
+    int error=sysctl_handle_int(oidp,&value,0,req);
+    if(error||!req->newptr)return(error);
+    if(value!=0&&value!=1)return(EINVAL);
+    error=priv_check(req->td,PRIV_DRIVER);if(error)return(error);
+    sx_xlock(&sc->lock);
+    if(sc->detaching||!sc->pcm_enabled||sc->poisoned)error=EBUSY;
+    else error=essx_codec_jack_detect(value);
+    sx_xunlock(&sc->lock);return(error);
+}
+
+static int
+micbias_trial_sysctl(SYSCTL_HANDLER_ARGS)
+{
+    struct essx_softc *sc=arg1;
+    int value=essx_codec_micbias_state();
+    int error=sysctl_handle_int(oidp,&value,0,req);
+    if(error||!req->newptr)return(error);
+    if(value!=0&&value!=1)return(EINVAL);
+    error=priv_check(req->td,PRIV_DRIVER);if(error)return(error);
+    sx_xlock(&sc->lock);
+    if(sc->detaching||!sc->pcm_enabled||sc->poisoned)error=EBUSY;
+    else error=essx_codec_micbias_trial(value);
+    sx_xunlock(&sc->lock);return(error);
+}
+
+static int
+bias_playback_sysctl(SYSCTL_HANDLER_ARGS)
+{
+    struct essx_softc *sc=arg1;
+    int value=essx_codec_bias_playback_state();
+    int error=sysctl_handle_int(oidp,&value,0,req);
+    if(error||!req->newptr)return(error);
+    if(value!=0&&value!=1)return(EINVAL);
+    error=priv_check(req->td,PRIV_DRIVER);if(error)return(error);
+    sx_xlock(&sc->lock);
+    if(sc->detaching||!sc->pcm_enabled||sc->poisoned)error=EBUSY;
+    else error=essx_codec_bias_playback(value);
+    sx_xunlock(&sc->lock);return(error);
+}
+
+static int
 essx_probe(device_t dev)
 {
     if(pci_get_devid(dev)!=0xa0c88086 || pci_get_domain(dev)!=0 ||
         pci_get_bus(dev)!=0 || pci_get_slot(dev)!=31 || pci_get_function(dev)!=3 ||
         pci_get_subvendor(dev)!=0x1e50 || pci_get_subdevice(dev)!=0x6004)
         return(ENXIO);
-    device_set_desc(dev,"Casper ES8336 SOF playback 0.19.0-rc1 (experimental)");
+    device_set_desc(dev,"Casper ES8336 SOF playback 0.20.0-rc1 (experimental)");
     return(BUS_PROBE_SPECIFIC);
 }
 static int
@@ -546,7 +668,7 @@ essx_attach(device_t dev)
     int r0=PCIR_BAR(0),r4=PCIR_BAR(4);
     sc->dev=dev;sx_init(&sc->lock,"essxsof control");
     sc->dac_attenuation=12; /* Known working baseline for manual loading. */
-    strlcpy(sc->driver_version,"0.19.0-rc1",sizeof(sc->driver_version));
+    strlcpy(sc->driver_version,"0.20.0-rc1",sizeof(sc->driver_version));
     sc->hda=bus_alloc_resource_any(dev,SYS_RES_MEMORY,&r0,RF_ACTIVE);
     sc->dsp=bus_alloc_resource_any(dev,SYS_RES_MEMORY,&r4,RF_ACTIVE);
     if(!sc->hda||!sc->dsp)goto failed;
@@ -563,6 +685,33 @@ essx_attach(device_t dev)
     if(SYSCTL_ADD_PROC(ctx,SYSCTL_CHILDREN(tree),OID_AUTO,"dac_attenuation",
         CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_MPSAFE,sc,0,attenuation_sysctl,"I",
         "DAC attenuation in dB (0..48), change only while PCM disabled")==NULL)goto failed;
+    if(SYSCTL_ADD_PROC(ctx,SYSCTL_CHILDREN(tree),OID_AUTO,"output_mode",
+        CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_MPSAFE,sc,0,output_mode_sysctl,"I",
+        "Root output: 0=speakers, 1=headphone test amp off, 2=headphone test amp on")==NULL)goto failed;
+    if(SYSCTL_ADD_PROC(ctx,SYSCTL_CHILDREN(tree),OID_AUTO,"jack_poll_prepare",
+        CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_MPSAFE,sc,0,jack_poll_prepare_sysctl,"I",
+        "Root writes 1 to select HP detection input with codec IRQ disabled")==NULL)goto failed;
+    if(SYSCTL_ADD_PROC(ctx,SYSCTL_CHILDREN(tree),OID_AUTO,"codec_snapshot",
+        CTLTYPE_STRING|CTLFLAG_RD|CTLFLAG_MPSAFE,sc,0,codec_snapshot_sysctl,"A",
+        "Read-only playback/detection register snapshot (sequential reads)")==NULL)goto failed;
+    if(SYSCTL_ADD_PROC(ctx,SYSCTL_CHILDREN(tree),OID_AUTO,"jack_gpio",
+        CTLTYPE_STRING|CTLFLAG_RD|CTLFLAG_MPSAFE,sc,0,jack_gpio_sysctl,"A",
+        "GPIO IRQ resource, event registers and interrupt counter")==NULL)goto failed;
+    if(SYSCTL_ADD_PROC(ctx,SYSCTL_CHILDREN(tree),OID_AUTO,"jack_detect_enable",
+        CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_MPSAFE,sc,0,jack_detect_sysctl,"I",
+        "Root enables codec jack IRQ after host handler ownership")==NULL)goto failed;
+    if(SYSCTL_ADD_PROC(ctx,SYSCTL_CHILDREN(tree),OID_AUTO,"jack_micbias_trial",
+        CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_MPSAFE,sc,0,micbias_trial_sysctl,"I",
+        "Root temporarily enables existing mic-bias supply for jack status comparison")==NULL)goto failed;
+    if(SYSCTL_ADD_PROC(ctx,SYSCTL_CHILDREN(tree),OID_AUTO,"jack_bias_playback",
+        CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_MPSAFE,sc,0,bias_playback_sysctl,"I",
+        "Root permits attenuated playback/route changes during held-bias test")==NULL)goto failed;
+    if(SYSCTL_ADD_PROC(ctx,SYSCTL_CHILDREN(tree),OID_AUTO,"jack_flags",
+        CTLTYPE_INT|CTLFLAG_RD|CTLFLAG_MPSAFE,sc,0,jack_status_sysctl,"I",
+        "Raw codec 0x4f; jack presence/polarity not yet calibrated")==NULL)goto failed;
+    if(SYSCTL_ADD_PROC(ctx,SYSCTL_CHILDREN(tree),OID_AUTO,"jack_pin",
+        CTLTYPE_INT|CTLFLAG_RD|CTLFLAG_MPSAFE,sc,1,jack_status_sysctl,"I",
+        "GPIO173 sampled input; no pin writes")==NULL)goto failed;
     SYSCTL_ADD_STRING(ctx,SYSCTL_CHILDREN(tree),OID_AUTO,"driver_version",
         CTLFLAG_RD,sc->driver_version,sizeof(sc->driver_version),"Driver release");
     sc->pcm_child=device_add_child(dev,"pcm",-1);

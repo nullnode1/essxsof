@@ -15,7 +15,7 @@ preserved=0
 while read -r checksum file; do
     [ "$checksum" != ESSXSOF-MANIFEST-1 ] || continue
     case "$file" in
-        boot/modules/essxsof.ko|boot/modules/essx8336_sof.ko|usr/local/sbin/essxsofctl|usr/local/etc/rc.d/essxsof|usr/local/libexec/essxsof/pcm-test) ;;
+        boot/modules/essxsof.ko|boot/modules/essx8336_sof.ko|usr/local/sbin/essxsofctl|usr/local/etc/rc.d/essxsof|usr/local/etc/rc.d/essxsoflate|usr/local/libexec/essxsof/pcm-test|usr/local/libexec/essxsof/essxsof-jackd) ;;
         *) echo 'Unexpected manifest path; stopped.' >&2; exit 1;;
     esac
     if [ -f "$dest/$file" ]; then

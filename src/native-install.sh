@@ -14,7 +14,7 @@ if [ -z "$dest" ]; then
 fi
 [ -f out/build-info ] || die 'run sh build.sh first'
 release=$(awk -F= '$1=="driver_version" {print $2}' out/build-info)
-[ "$release" = 0.19.0-rc1 ] || die 'build-info version mismatch'
+[ "$release" = 0.20.0-rc1 ] || die 'build-info version mismatch'
 [ "$(awk -F= '$1=="machine" {print $2}' out/build-info)" = amd64 ] || die 'module architecture mismatch'
 if [ -z "$dest" ]; then
     built=$(awk -F= '$1=="kernel_osreldate" {print $2}' out/build-info)
@@ -26,7 +26,7 @@ for pair in driver_sha256:out/essxsof.ko firmware_module_sha256:out/essx8336_sof
     [ "$(sha256 -q "$file")" = "$expected" ] || die "checksum mismatch: $file"
 done
 # Refuse name collisions with files not owned by this package.
-files='boot/modules/essxsof.ko boot/modules/essx8336_sof.ko usr/local/sbin/essxsofctl usr/local/etc/rc.d/essxsof usr/local/libexec/essxsof/pcm-test'
+files='boot/modules/essxsof.ko boot/modules/essx8336_sof.ko usr/local/sbin/essxsofctl usr/local/etc/rc.d/essxsof usr/local/etc/rc.d/essxsoflate usr/local/libexec/essxsof/pcm-test usr/local/libexec/essxsof/essxsof-jackd'
 if [ ! -f "$share/INSTALL-MANIFEST" ]; then
     for file in $files; do
         [ ! -e "$dest/$file" ] && [ ! -L "$dest/$file" ] || die "unmanaged existing file: /$file"
@@ -52,7 +52,9 @@ put 644 out/essxsof.ko boot/modules/essxsof.ko
 put 644 out/essx8336_sof.ko boot/modules/essx8336_sof.ko
 put 755 sbin/essxsofctl usr/local/sbin/essxsofctl
 put 755 rc.d/essxsof usr/local/etc/rc.d/essxsof
+put 755 rc.d/essxsoflate usr/local/etc/rc.d/essxsoflate
 put 755 out/pcm-test usr/local/libexec/essxsof/pcm-test
+put 755 sbin/essxsof-jackd usr/local/libexec/essxsof/essxsof-jackd
 put 644 etc/essxsof.conf.sample usr/local/etc/essxsof.conf.sample
 if [ ! -e "$dest/usr/local/etc/essxsof.conf" ]; then
     put 644 etc/essxsof.conf.sample usr/local/etc/essxsof.conf

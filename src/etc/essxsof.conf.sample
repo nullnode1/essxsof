@@ -10,3 +10,9 @@ essxsof_dac_attenuation=0
 essxsof_master=25
 essxsof_pcm=100
 essxsof_set_default=YES
+# Automatic headphone/speaker switching. NO = rc1 behavior (speakers only).
+# YES starts the root monitor essxsof-jackd with the service. Tested on this
+# laptop with one mic-equipped headphone only; headset buttons/recording and
+# other plugs are not validated. Close players and restart the service after
+# changing this value.
+essxsof_jack_auto=NO

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-2-Clause
 set -eu
 export LC_ALL=C
-version=0.19.0-rc1
+version=0.20.0-rc1
 root=${ESSXSOF_ROOT:-}
 share="$root/usr/local/share/essxsof"
 state="$root/var/run/essxsof"
@@ -18,6 +18,7 @@ load_config() {
     essxsof_master=25
     essxsof_pcm=100
     essxsof_set_default=YES
+    essxsof_jack_auto=NO
     if [ -f "$config" ]; then . "$config"; fi
     case "$essxsof_gpio" in 0|1) ;; *) die 'gpio must be 0 or 1';; esac
     for value in "$essxsof_dac_attenuation" "$essxsof_master" "$essxsof_pcm"; do
@@ -26,6 +27,7 @@ load_config() {
     [ "$essxsof_dac_attenuation" -le 48 ] || die 'dac_attenuation must be 0..48 dB'
     [ "$essxsof_master" -le 100 ] && [ "$essxsof_pcm" -le 100 ] || die 'master/pcm must be 0..100'
     case "$essxsof_set_default" in YES|NO) ;; *) die 'set_default must be YES or NO';; esac
+    case "$essxsof_jack_auto" in YES|NO) ;; *) die 'jack_auto must be YES or NO';; esac
 }
 preflight() {
     [ "$(uname -s)" = FreeBSD ] && [ "$(uname -m)" = amd64 ] || die 'FreeBSD amd64 required'
@@ -56,7 +58,122 @@ restore_default() {
         esac
     fi
 }
+jackd="$root/usr/local/libexec/essxsof/essxsof-jackd"
+jackpid="$state/jackd.pid"
+jackd_pid() {
+    [ -f "$jackpid" ] || return 1
+    pid=$(cat "$jackpid" 2>/dev/null) || return 1
+    case "$pid" in ''|*[!0-9]*) return 1;; esac
+    # FreeBSD 15.1: use the actual full process listing. The -o command=
+    # form can hide script arguments and has given false negatives here.
+    # Compare the *exact* PID and the executable script argument; do not
+    # accidentally accept the parent daemon wrapper containing [child-pid].
+    ps axww 2>/dev/null | awk -v pid="$pid" -v script="$jackd" '
+        NR > 1 && $1 == pid {
+            for (i=2; i<=NF; ++i) {
+                if ($i == script) found=1
+            }
+        }
+        END {exit(found ? 0 : 1)}
+    ' || return 1
+    printf '%s\n' "$pid"
+}
+# If a PID file references a live but unidentified process, refuse to
+# create a second monitor or kill an unrelated process. Always fail closed.
+jackd_unknown_live_pid() {
+    [ -f "$jackpid" ] || return 1
+    unknown=$(cat "$jackpid" 2>/dev/null) || return 1
+    case "$unknown" in ''|*[!0-9]*) return 1;; esac
+    kill -0 "$unknown" 2>/dev/null || return 1
+    jackd_pid >/dev/null && return 1
+    return 0
+}
+# Read-only fallback for desktop users. /var/run/essxsof is mode 0700,
+# so a non-root user cannot even stat the protected PID file in it:
+# testing [ -f "$jackpid" ] is NOT a valid visibility check.
+# Never relax permissions or use this fallback in start/stop/kill paths.
+# Count exactly one standalone monitor process; this is a qualified
+# status report, NOT a PID-file verification.
+jackd_visible_without_pid() {
+    [ "$(id -u)" -ne 0 ] || return 1
+    # The daemon wrapper contains '[PID]' appended to the script path,
+    # so it must NOT count as a standalone Python monitor.
+    ps axww 2>/dev/null | awk -v script="$jackd" '
+        NR > 1 && $1 ~ /^[0-9]+$/ {
+            for (i=2; i<=NF; ++i) {
+                if ($i == script) { count++; break }
+            }
+        }
+        END { exit(count == 1 ? 0 : 1) }
+    '
+}
+# The monitor must be gone before native detach; never force it.
+stop_jackd() {
+    if ! pid=$(jackd_pid); then
+        if jackd_unknown_live_pid; then
+            echo 'jack monitor PID points to an unidentified live process; refusing unsafe stop.' >&2
+            return 1
+        fi
+        rm -f "$jackpid"
+        return 0
+    fi
+    kill -TERM "$pid" || return 1
+    n=0
+    while kill -0 "$pid" 2>/dev/null; do
+        n=$((n + 1))
+        [ "$n" -le 100 ] || { echo 'essxsof-jackd did not stop; driver left running, not forcing.' >&2; return 1; }
+        sleep 0.1
+    done
+    rm -f "$jackpid"
+}
+# Started OUTSIDE the service lock so the daemon cannot inherit the lock fd.
+start_jackd() {
+    load_config
+    [ "$essxsof_jack_auto" = YES ] || return 0
+    if jackd_pid >/dev/null; then return 0; fi
+    if jackd_unknown_live_pid; then
+        echo 'jack monitor PID ambiguous; refusing to start a second process.' >&2
+        return 0
+    fi
+    [ "$(get dev.essxsof.0.pcm_enable || :)" = 1 ] || { echo 'jack auto routing skipped: playback inactive.' >&2; return 0; }
+    [ -x "$jackd" ] || { echo 'jack auto routing skipped: essxsof-jackd missing.' >&2; return 0; }
+    # The codec/PCI side may be ready before jack GPIO reads have settled.
+    # Retry only this user-space monitor; NEVER detach/reload the kernel here.
+    attempt=1
+    while [ "$attempt" -le 3 ]; do
+        if jackd_pid >/dev/null; then return 0; fi
+        if daemon -S -T essxsof-jackd -p "$jackpid" "$jackd"; then
+            n=0
+            while [ "$n" -lt 70 ]; do
+                if [ "$(get dev.essxsof.0.jack_bias_playback || :)" = 1 ]; then
+                    echo 'essxsof jack auto routing active (tested on this laptop only).'
+                    return 0
+                fi
+                jackd_pid >/dev/null || break
+                n=$((n + 1)); sleep 0.1
+            done
+        fi
+        # Never start a second monitor while an unresponsive first is alive.
+        if jackd_pid >/dev/null; then
+            echo 'jack monitor still initializing; not starting a duplicate' >&2
+            return 0
+        fi
+        # The old monitor owns teardown of trial/detect/bias on exit.
+        if [ "$(get dev.essxsof.0.jack_bias_playback || :)" = 1 ] || \
+           [ "$(get dev.essxsof.0.jack_detect_enable || :)" = 1 ] || \
+           [ "$(get dev.essxsof.0.jack_micbias_trial || :)" = 1 ]; then
+            echo 'jack monitor exited without clean teardown; refusing retry' >&2
+            return 0
+        fi
+        echo "jack monitor setup not ready (attempt $attempt/3); retrying" >&2
+        attempt=$((attempt + 1))
+        [ "$attempt" -le 3 ] && sleep 2
+    done
+    echo 'jack monitor not ready; playback retained. Late boot service will retry.' >&2
+    return 0
+}
 stop_driver() {
+    stop_jackd || return 1
     current=$(owner)
     clear=NO
     case "$current" in
@@ -133,6 +250,17 @@ status_driver() {
             sysctl "dev.pcm.$number.essx_fault"
             [ "$(get "dev.pcm.$number.essx_fault")" = 0 ] || return 2
         fi
+        if jackd_pid >/dev/null; then
+            echo "jack auto routing: running, output_mode=$(get dev.essxsof.0.output_mode || echo ?), flags=$(get dev.essxsof.0.jack_flags || echo ?)"
+        elif [ "$(get dev.essxsof.0.jack_bias_playback || :)" = 1 ]; then
+            if jackd_visible_without_pid; then
+                echo "jack auto routing: running (one monitor process visible; PID unverified), output_mode=$(get dev.essxsof.0.output_mode || echo ?), flags=$(get dev.essxsof.0.jack_flags || echo ?)"
+            else
+                echo 'jack auto routing: unknown (jack hardware active, monitor PID not verified)'
+            fi
+        else
+            echo 'jack auto routing: off'
+        fi
         return 0
     fi
     echo 'essxsof playback is inactive.'
@@ -158,7 +286,8 @@ case "$action" in
     start|stop|restart)
         [ ! -L "$state" ] || die 'state directory must not be a symlink'
         install -d -m 700 "$state"
-        exec lockf -t 0 "$root/var/run/essxsof.lock" "$0" "_$action";;
+        lockf -t 0 "$root/var/run/essxsof.lock" "$0" "_$action" || exit $?
+        case "$action" in start|restart) start_jackd;; esac;;
     _start) start_driver;;
     _stop) stop_driver;;
     _restart) stop_driver; start_driver;;

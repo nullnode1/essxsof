@@ -242,7 +242,7 @@ essx_pcm_halt(device_t dev)
 static int
 essx_pcm_probe(device_t dev)
 {
-    device_set_desc(dev,"Casper ES8336 SOF speaker playback 0.19.0-rc1");
+    device_set_desc(dev,"Casper ES8336 SOF speaker playback 0.20.0-rc1");
     return(BUS_PROBE_DEFAULT);
 }
 

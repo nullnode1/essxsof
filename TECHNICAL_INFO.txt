@@ -1,0 +1,93 @@
+ESSXSOF 1.0.0 - TECHNICAL REFERENCE / REGISTER NOTES
+===================================================
+Applies only to the hardware-tested Casper Nirvana NB F500 / TN1 001,
+FreeBSD 15.1-RELEASE amd64. Native kernel driver version: 0.20.0-rc1.
+
+This is an implementation summary audited against src/essx_codec.c,
+src/essxsof.c, src/essx_gpio.c, src/essx_ipc.c, src/essx_pcm.c and
+src/sbin/essxsof-jackd. It is NOT a complete vendor register datasheet.
+Read docs/HARDWARE_REGISTERS.md and docs/DRIVER_INTERNALS.md for details.
+
+HARDWARE
+--------
+PCI       : 8086:a0c8, subsystem 1e50:6004, bus 0 device 31 function 3
+ACPI      : ESSX8336, _SUB = 70061E50
+I2C       : 7-bit codec address 0x11 (driver bus address field 0x22)
+Firmware  : Intel-signed sof-tgl.ri, firmware resource essx8336_sof
+Speaker   : GPIO174, ACPI pad selector 0x0908000e; low/off for headphone
+Jack input: GPIO173 / GPP_D13, pad selector 0x0908000d
+Audio     : playback-only, OSS 48 kHz s16le stereo; SOF I2S 24 valid bits
+
+ES8336 REGISTER WRITE MAP (mask -> value)
+-----------------------------------------
+Startup: 0x30 20->20 (DAC mute), 0x00 ff->80 (CSM), 0x0c ff->ff,
+         0x03 ff->32, 0x01 f4->74 (clock), 0x09 bf->04, 0x0b 3f->00
+         (I2S/24 bit), 0x06 0f->01, 0x07 ff->90 (19.2MHz/48kHz),
+         0x33 ff->attenuation_db*2, 0x34 ff->attenuation_db*2,
+         0x0d 19->00 (analog bias/power),
+         0x14 cc->88, 0x15 33->00, 0x18 bb->11,
+         0x19 04->00, 0x1a 20->00, 0x17 66->66, 0x2f 11->00.
+
+Routing: DAC mute through 0x30 bit 0x20; change DAC 0x33/0x34 and
+         analog field 0x18 mask 0x33; change GPIO174 amp; wait ~70ms;
+         unmute only on success. Speaker: 0x18 masked value 0x11,
+         GPIO174 normally 1. Headphones: 0x18 masked value 0x00,
+         GPIO174 0. Headphone DAC attenuation is >=18 dB.
+
+Detection: 0x4d bit0->0 selects HPInserted; 0x4e bit1 manages codec
+           IRQ enable after guarded host ownership; 0x4f read-only status.
+           On THIS board and with held jack bias:
+           0x4f = 0x22 (decimal 34) -> unplugged / speakers
+           0x4f = 0x20 (decimal 32) -> plugged / headphones
+           Other values are unknown; no route should be forced.
+           0x0d bit5 is used in a controlled mic-bias detection trial;
+           it does NOT implement microphone recording.
+
+I2C writes use a read-modify-write mask, readback verification, a register
+allowlist, and a saved-state reverse-order rollback on shutdown/failure.
+Board-specific ACPI guards reject mismatched GPIO ownership/direction.
+
+INTEL HDA / DSP SOURCE OFFSETS (relative to BAR, not physical addresses)
+-----------------------------------------------------------------------
+HDA BAR0: 0x08 reset; SD0=0x80 boot companion; SD7=0x160 transfer/playback;
+          PPCTL=0x804; SPIBCTL=0x704; SPIB7=0x740;
+          0x1030 and 0x1048 saved/restored power/latency controls.
+DSP BAR4: ADSPCS=0x04; HIPCTDR=0xc0; HIPCTDA=0xc4;
+          HIPCIDR=0xd0; HIPCIDA=0xd4; ROM_STATUS=0x80000.
+PCI config 0x44/0x48 are saved/restored during initialization and quiesce.
+Firmware validates XMan and $CPD metadata, then performs FW_READY IPC3.
+
+SOF pipeline: HOST -> 768-byte BUFFER -> SSP0 DAI, stereo, 48k, 24 valid
+bits in 32-bit slots, MCLK 19.2MHz, BCLK 3.072MHz. The user-facing PCM
+channel is PLAYBACK ONLY. ROM-time SD0 use is not microphone capture.
+
+BOOT, OUTPUTS, AND SAFETY
+-------------------------
+FreeBSD rc.d starts kernel playback; essxsoflate retries the jack service
+without reloading the running driver; user login starts per-user PulseAudio
+profiles after the backend is ready. Expected sinks: ESSXSOF Speakers,
+ESSXSOF Headphones, essx_oss_fast (technical backend). They share one DAC.
+
+Commands (read-only):
+  essxsofctl status
+  ~/.local/bin/essx-desktop status
+  pactl list short sinks
+  pactl list short sources
+  sysctl dev.essxsof.0.jack_flags
+  sysctl dev.essxsof.0.output_mode
+  sysctl dev.pcm.0.essx_fault
+  sh diagnose.sh     (run from the unpacked release directory)
+
+Install: run sh install.sh as normal desktop user in release directory.
+Uninstall desktop only: sh uninstall-desktop.sh
+Uninstall whole package: sh uninstall.sh (requires root confirmation).
+Do not force unload when driver refuses a safe detach. Keep backups.
+
+LIMITATIONS AND CREDIT
+----------------------
+Only the identified board was tested. No ES8336 microphone capture and no
+reliable suspend/resume claim. Third-party signed firmware and Linux/Intel
+reference material keep their own licenses, see LICENSE and licenses/.
+Developed with AI assistance; hardware tests were supplied by the maintainer.
+The release build's cosmetic cleanup change still needs a final on-device
+installation check; offline unit tests are not FreeBSD hardware tests.

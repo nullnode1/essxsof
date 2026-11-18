@@ -1,0 +1,32 @@
+ESSXSOF distribution: 1.0.0
+Date: 2026-11-18
+FreeBSD target: 15.1-RELEASE amd64
+Original tested laptop: Casper Nirvana NB F500 / Intel Tiger Lake / Everest ES8336
+Native kernel module reports: 0.20.0-rc1 (native C code unchanged)
+
+FIELD OBSERVATIONS (prior release candidates)
+- Speakers and wired headphone sound: PASS on original laptop
+- Automatic plugged/unplugged jack transitions: PASS on original laptop
+- RC2 reboot with wired headphones connected: daemon and user desktop started
+- RC5 ordinary user PID status: PASS
+- RC5 PCM fault counter: 0
+- RC5 optional cleanup: raced with PulseAudio module changes, installer returned failure although 3 desired sinks were active
+
+1.0.0 CHANGES
+- Optional duplicate OSS cleanup revalidates sink/module/capture identity before each unload
+- Stale/disappeared modules skipped; optional cleanup failures are warnings rather than fatal to otherwise functioning profiles
+- No native kernel C or firmware changes; no microphone capture added
+
+OFFLINE VERIFICATION
+- Python regression tests, jack monitor simulation tests, shell syntax checks, source hashes, zip checksum verification
+- These tests do not confirm behavior on the FreeBSD hardware or guarantee universal ES8336 compatibility
+
+PUBLICATION NOTE
+- One final physical install / restart / hotplug acceptance pass is recommended after packaging.
+
+DOCUMENTATION AUDIT (1.0.0 GitHub-ready supplement)
+- Added exact codec masks, jack register behavior, GPIO and PCI/DSP notes
+- Added source-mapped SOF/IPC3 and PCM architecture, plain-text references
+- Existing nullnode1/essxsof main history retained in publishing instructions
+- No native driver C, firmware or installer runtime code changed in this supplement
+- Documentation regression tests added; hardware acceptance still pending

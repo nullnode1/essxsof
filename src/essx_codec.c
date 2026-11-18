@@ -27,12 +27,16 @@
 #endif
 
 #define AMP_PAD 0x0908000eU
+#define JACK_IRQ_PAD 0x0908000dU
+#define JACK_FLAG_REG 0x4f
 static const uint8_t codec_regs[]={0x30,0x00,0x0c,0x03,0x01,0x09,0x0b,
-    0x06,0x07,0x33,0x34,0x0d,0x14,0x15,0x18,0x19,0x1a,0x17,0x2f};
+    0x06,0x07,0x33,0x34,0x0d,0x14,0x15,0x18,0x19,0x1a,0x17,0x2f,
+    0x4d,0x4e}; /* input selection / IRQ control: journal before polling setup */
 struct essx_codec {
     device_t dev;
     uint8_t saved[nitems(codec_regs)];
-    bool touched[nitems(codec_regs)], active;
+    bool touched[nitems(codec_regs)], active, jack_detect_enabled, micbias_trial, bias_playback;
+    uint8_t trial_bias_original,trial_mute_original;
     uint32_t pad_original;
 };
 static struct essx_codec *codec;
@@ -76,9 +80,9 @@ codec_update(struct essx_codec *c,uint8_t reg,uint8_t mask,uint8_t value)
 }
 
 static int
-pad_get(const char *path,uint32_t *v)
+pad_get_for(uint32_t pad,const char *path,uint32_t *v)
 {
-    ACPI_OBJECT in={.Integer={.Type=ACPI_TYPE_INTEGER,.Value=AMP_PAD}},out={0};
+    ACPI_OBJECT in={.Integer={.Type=ACPI_TYPE_INTEGER,.Value=pad}},out={0};
     ACPI_OBJECT_LIST args={.Count=1,.Pointer=&in};
     ACPI_BUFFER buf={.Length=sizeof(out),.Pointer=&out};
     ACPI_STATUS s=AcpiEvaluateObject(NULL,__DECONST(char *,path),&args,&buf);
@@ -86,6 +90,12 @@ pad_get(const char *path,uint32_t *v)
         return(EIO);
     *v=(uint32_t)out.Integer.Value;
     return(0);
+}
+
+static int
+pad_get(const char *path,uint32_t *v)
+{
+    return(pad_get_for(AMP_PAD,path,v));
 }
 
 static int
@@ -138,6 +148,12 @@ codec_rollback(struct essx_codec *c)
     int error=0,e;
     unsigned i;
     if(!c->active) return(0);
+    /* Mask the host source even after an I2C error; keep busy on error. */
+    if(c->jack_detect_enabled) {
+        e=codec_update(c,0x4e,0x02,0);if(e)error=e;
+        e=essx_jack_gpio_disarm();if(e)error=e;
+        if(!error)c->jack_detect_enabled=false;
+    }
     /* Best effort on every element even if an earlier write fails. */
     e=codec_update(c,0x30,0x20,0x20); if(e)error=e;
     e=pad_set(c->pad_original); if(e)error=e;
@@ -145,7 +161,7 @@ codec_rollback(struct essx_codec *c)
     for(i=nitems(codec_regs);i>0;i--) if(c->touched[i-1]) {
         e=codec_write(c,codec_regs[i-1],c->saved[i-1]); if(e)error=e;
     }
-    if(!error) {c->active=false;device_unbusy(c->dev);}
+    if(!error) {c->active=false;c->micbias_trial=false;c->bias_playback=false;device_unbusy(c->dev);}
     device_printf(c->dev,"codec/GPIO restore=%s errno=%d\n",error?"failed":"ok",error);
     return(error);
 }
@@ -197,6 +213,7 @@ essx_codec_output(int level)
     int error;
     sx_xlock(&codec_lock);
     if(!codec||!codec->active) {error=ENXIO;goto out;}
+    if(codec->micbias_trial&&!codec->bias_playback) {error=EBUSY;goto out;}
     error=codec_update(codec,0x30,0x20,0x20);
     if(!error) error=pad_set(level);
     if(!error) {pause("essxamp",MAX(1,7*hz/100));error=codec_update(codec,0x30,0x20,0);}
@@ -210,6 +227,248 @@ essx_codec_restore(void)
     int error;
     sx_xlock(&codec_lock);error=codec?codec_rollback(codec):0;sx_xunlock(&codec_lock);
     return(error);
+}
+
+/* Linux's machine driver shares HPOL/HPOR between the two endpoints.
+ * Board wiring still needs listener confirmation. Mode 2 is a temporary
+ * diagnostic with the speaker amplifier enabled; it may sound from both.
+ * The ES8336D 0x18 gain fields are set to unity for headphone tests, while
+ * keeping DAC attenuation >=18 dB. Speaker mode keeps its proven -12 dB
+ * analog setting. No supply voltages, mic bias or GPIO173 writes are made.
+ */
+int
+essx_codec_route(int speaker_level,unsigned attenuation_db,int headphones)
+{
+    struct essx_codec *c;
+    unsigned attenuation;
+    int error;
+    if((speaker_level!=0&&speaker_level!=1)||attenuation_db>48||
+        (headphones<0||headphones>2))return(EINVAL);
+    attenuation=headphones?MAX(attenuation_db,18u):attenuation_db;
+    sx_xlock(&codec_lock);c=codec;
+    if(!c||!c->active) {error=ENXIO;goto out;}
+    if(c->micbias_trial&&!c->bias_playback) {error=EBUSY;goto out;}
+    error=codec_update(c,0x30,0x20,0x20);
+    if(!error)error=codec_update(c,0x33,0xff,attenuation*2);
+    if(!error)error=codec_update(c,0x34,0xff,attenuation*2);
+    if(!error)error=codec_update(c,0x18,0x33,headphones?0:0x11);
+    if(!error)error=pad_set(headphones==1?0:(uint32_t)speaker_level);
+    if(!error) {
+        pause("essxroute",MAX(1,7*hz/100));
+        error=codec_update(c,0x30,0x20,0);
+    }
+    if(error) {
+        /* Even an error after the unmute write must try to mute again. */
+        (void)codec_update(c,0x30,0x20,0x20);
+        device_printf(c->dev,"output switch failed; mute requested errno=%d\n",error);
+    } else device_printf(c->dev,"output=%s amp=%d DAC attenuation=%udB\n",
+        headphones?"headphones-test":"speakers",headphones==1?0:speaker_level,attenuation);
+out:
+    sx_xunlock(&codec_lock);return(error);
+}
+
+/* ES8336D rev3.0 0x4d bit0: 0=HPInserted input, 1=ADCLRCK I/O.
+ * Select the documented detection input without enabling an unclaimed IRQ.
+ * Preserve polarity/debounce and all unrelated bits; rollback owns both regs.
+ */
+int
+essx_codec_jack_poll_prepare(void)
+{
+    int error;
+    sx_xlock(&codec_lock);
+    if(!codec||!codec->active)error=ENXIO;
+    else if(codec->jack_detect_enabled)error=EBUSY;
+    else {
+        error=codec_update(codec,0x4e,0x02,0); /* IRQ disabled; polling only */
+        if(!error)error=codec_update(codec,0x4d,0x01,0);
+        if(!error)pause("essxjack",MAX(1,hz/2)); /* longest documented debounce */
+        else (void)codec_update(codec,0x30,0x20,0x20);
+    }
+    sx_xunlock(&codec_lock);return(error);
+}
+
+/* Bounded, read-only whitelist. Never expose arbitrary register writes. */
+int
+essx_codec_snapshot(char *text,size_t length)
+{
+    static const uint8_t regs[]={0x00,0x01,0x08,0x0c,0x0d,0x13,0x14,0x15,
+        0x16,0x17,0x18,0x19,0x1a,0x1b,0x2f,0x30,0x31,0x33,0x34,0x4d,0x4e,0x4f};
+    uint8_t value;
+    size_t used=0;
+    int error=0,n;
+    if(text==NULL||length<1)return(EINVAL);
+    text[0]='\0';
+    sx_xlock(&codec_lock);
+    if(!codec||!codec->active) {error=ENXIO;goto out;}
+    for(unsigned i=0;i<nitems(regs);i++) {
+        error=codec_read(codec,regs[i],&value);if(error)break;
+        n=snprintf(text+used,length-used,"%s%02x=%02x",i?" ":"",regs[i],value);
+        if(n<0||(size_t)n>=length-used) {error=ENOSPC;break;}
+        used+=(size_t)n;
+    }
+out:
+    sx_xunlock(&codec_lock);return(error);
+}
+
+/* Raw diagnostic status only. Reading 0x4f is the same register used by
+ * Linux v6.12 es8316_irq(); do not assume the HP bit polarity for this board.
+ * When explicitly enabled, the host filter is one-shot; a successful
+ * status read rearms it outside interrupt context.
+ */
+int
+essx_codec_jack_flags(int *flags)
+{
+    uint8_t value=0;
+    int error;
+    if(flags==NULL)return(EINVAL);
+    sx_xlock(&codec_lock);
+    error=(!codec||!codec->active)?ENXIO:codec_read(codec,JACK_FLAG_REG,&value);
+    if(!error&&codec->jack_detect_enabled)error=essx_jack_gpio_rearm();
+    if(!error)*flags=value;
+    sx_xunlock(&codec_lock);return(error);
+}
+
+int
+essx_codec_jack_detect_state(void)
+{
+    int enabled;
+    sx_xlock(&codec_lock);enabled=codec&&codec->jack_detect_enabled;
+    sx_xunlock(&codec_lock);return(enabled);
+}
+
+/* Root-only caller; an actual host IRQ handler must exist before int_en.
+ * Preserve debounce and polarity; accept only the known active-high pair. */
+int
+essx_codec_jack_detect(int enable)
+{
+    struct essx_codec *c;
+    uint8_t config;
+    int error=0,e,disable_error;
+    if(enable!=0&&enable!=1)return(EINVAL);
+    sx_xlock(&codec_lock);c=codec;
+    if(!c||!c->active) {error=ENXIO;goto out;}
+    if(!enable&&c->micbias_trial) {error=EBUSY;goto out;}
+    if(!!enable==c->jack_detect_enabled)goto out;
+    if(enable) {
+        error=codec_read(c,0x4e,&config);if(error)goto out;
+        if(config&0x03) {error=EBUSY;goto out;}
+        error=essx_jack_gpio_arm();if(error)goto out;
+        c->jack_detect_enabled=true;
+        error=codec_update(c,0x4e,0x02,0x02);
+        if(!error)error=essx_jack_gpio_rearm();
+        if(!error)goto out;
+    }
+    disable_error=codec_update(c,0x4e,0x02,0);
+    e=essx_jack_gpio_disarm();if(!disable_error)disable_error=e;
+    if(!disable_error)c->jack_detect_enabled=false;
+    if(disable_error&&!error)error=disable_error;
+    if(error)(void)codec_update(c,0x30,0x20,0x20);
+out:
+    sx_xunlock(&codec_lock);return(error);
+}
+
+int
+essx_codec_micbias_state(void)
+{
+    int enabled;
+    sx_xlock(&codec_lock);enabled=codec&&codec->micbias_trial;
+    sx_xunlock(&codec_lock);return(enabled);
+}
+
+/* Linux es8316 enables Bias/Analog power/Mic Bias for mic-ground detection.
+ * Playback has already enabled Bias and Analog power (0x0d bits3/4=0).
+ * This bounded trial toggles only pdnMic bit5, with no voltage selection,
+ * ADC stream, pin direction or gain changes. Mute before either transition.
+ */
+int
+essx_codec_micbias_trial(int enable)
+{
+    struct essx_codec *c;
+    uint8_t bias,mute;
+    int error=0,restore_error,e;
+    if(enable!=0&&enable!=1)return(EINVAL);
+    sx_xlock(&codec_lock);c=codec;
+    if(!c||!c->active) {error=ENXIO;goto out;}
+    if(!enable&&c->bias_playback) {error=EBUSY;goto out;}
+    if(!!enable==c->micbias_trial)goto out;
+    if(enable) {
+        if(!c->jack_detect_enabled) {error=EBUSY;goto out;}
+        error=codec_read(c,0x0d,&bias);if(error)goto out;
+        error=codec_read(c,0x30,&mute);if(error)goto out;
+        /* Refuse an already-on or unpowered baseline: it would not be the
+         * controlled OFF/ON comparison this diagnostic claims to perform. */
+        if((bias&0x38)!=0x20) {error=EBUSY;goto out;}
+        c->trial_bias_original=bias&0x20;c->trial_mute_original=mute&0x20;
+        c->micbias_trial=true;
+        error=codec_update(c,0x30,0x20,0x20);
+        if(!error)error=codec_update(c,0x0d,0x20,0);
+        if(!error) {pause("essxmicbias",MAX(1,hz/50));goto out;}
+    }
+    /* On disable, leave DAC muted until bias restoration has succeeded. */
+    restore_error=codec_update(c,0x30,0x20,0x20);
+    e=codec_update(c,0x0d,0x20,c->trial_bias_original);
+    if(!restore_error)restore_error=e;
+    if(!restore_error) {
+        pause("essxmicbias",MAX(1,hz/50));
+        restore_error=codec_update(c,0x30,0x20,c->trial_mute_original);
+    }
+    if(!restore_error)c->micbias_trial=false;
+    else (void)codec_update(c,0x30,0x20,0x20);
+    if(restore_error&&!error)error=restore_error;
+out:
+    sx_xunlock(&codec_lock);return(error);
+}
+
+int
+essx_codec_bias_playback_state(void)
+{
+    int enabled;
+    sx_xlock(&codec_lock);enabled=codec&&codec->bias_playback;
+    sx_xunlock(&codec_lock);return(enabled);
+}
+
+/* Explicit audio permission while holding the validated bias trial.
+ * This adds no automatic routing or background kernel worker. Userspace
+ * may call the existing muted/attenuated route operation after admission.
+ */
+int
+essx_codec_bias_playback(int enable)
+{
+    struct essx_codec *c;
+    int error=0;
+    if(enable!=0&&enable!=1)return(EINVAL);
+    sx_xlock(&codec_lock);c=codec;
+    if(!c||!c->active) {error=ENXIO;goto out;}
+    if(!!enable==c->bias_playback)goto out;
+    if(!c->micbias_trial||!c->jack_detect_enabled) {error=EBUSY;goto out;}
+    error=codec_update(c,0x30,0x20,enable?0:0x20);
+    if(!error)c->bias_playback=!!enable;
+    else (void)codec_update(c,0x30,0x20,0x20);
+out:
+    sx_xunlock(&codec_lock);return(error);
+}
+
+int
+essx_codec_jack_pin(int *level)
+{
+    uint32_t number,dw;
+    int error;
+    if(level==NULL)return(EINVAL);
+    sx_xlock(&codec_lock);
+    if(!codec||!codec->active) {error=ENXIO;goto out;}
+    error=pad_get_for(JACK_IRQ_PAD,"\\_SB.GNUM",&number);
+    if(error)goto out;
+    if(number!=173) {error=ENXIO;goto out;}
+    error=pad_get_for(JACK_IRQ_PAD,"\\_SB.GPC0",&dw);
+    if(error)goto out;
+    /* Reviewed ACPI getters only; insist on GPIO mode, TX disabled and
+     * RX enabled. GPIO173 is an input/IRQ and is never driven here. */
+    if(((dw>>10)&7)!=0||(dw&(1u<<8))==0||(dw&(1u<<9))!=0) {
+        error=ENXIO;goto out;
+    }
+    *level=(int)((dw>>1)&1);
+out:
+    sx_xunlock(&codec_lock);return(error);
 }
 
 #ifndef ESSX_CODEC_TEST

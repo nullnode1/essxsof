@@ -1,0 +1,630 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
+"""ESSXSOF user-session audio profiles for one FreeBSD ES8336 playback device.
+
+This is a playback-only PulseAudio UI layer. Physical routing is exclusively
+controlled by the installed ESSXSOF kernel driver and its jack daemon.
+"""
+from __future__ import annotations
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+VERSION = "1.0.0"
+BACKEND = "essx_oss_fast"
+PORTS = {0: "essx_dahili_hoparlor", 1: "essx_jak_kulaklik"}
+LABELS = {0: "ESSXSOF Speakers", 1: "ESSXSOF Headphones"}
+DEFAULT_LEVELS = {0: 85, 1: 70}
+PROFILE = "essxsof-managed-oss-48k-v1"
+
+class AudioError(Exception):
+    pass
+
+def command(*args):
+    run = subprocess.run([str(a) for a in args], capture_output=True, text=True,
+                         errors="replace", timeout=10)
+    if run.returncode:
+        raise AudioError((run.stderr or run.stdout).strip() or f"Command failed: {args[0]}")
+    return run.stdout.strip()
+
+def pa(*args):
+    return command("pactl", *args)
+
+def json_list(kind):
+    data = json.loads(pa("-f", "json", "list", kind))
+    if not isinstance(data, list):
+        raise AudioError(f"Unexpected PulseAudio {kind} response")
+    return data
+
+def sinks():
+    return {v["name"]: v for v in json_list("sinks")}
+
+def modules():
+    result = {}
+    for line in pa("-f", "text", "list", "short", "modules").splitlines():
+        parts = line.split("\t", 3)
+        if len(parts) >= 2 and parts[0].isdigit():
+            result[int(parts[0])] = (parts[1], parts[2] if len(parts) > 2 else "")
+    return result
+
+def module_args(value):
+    return shlex.split(value)
+
+def sink_owner(sink):
+    try:
+        return int(sink.get("owner_module", -1))
+    except (ValueError, TypeError):
+        return -1
+
+def volume_percent(sink):
+    try:
+        values = [int(x["value"]) for x in sink.get("volume", {}).values()]
+        return round(sum(values) * 100 / (len(values) * 65536)) if values else None
+    except (TypeError, ValueError, KeyError, ZeroDivisionError):
+        return None
+
+def hardware():
+    if command("sysctl", "-n", "dev.essxsof.0.driver_version") != "0.20.0-rc1":
+        raise AudioError("ESSXSOF kernel driver 0.20.0-rc1 is required")
+    if command("sysctl", "-n", "dev.essxsof.0.pcm_enable") != "1":
+        raise AudioError("ESSXSOF PCM playback is inactive")
+    if command("sysctl", "-n", "dev.essxsof.0.jack_bias_playback") != "1":
+        raise AudioError("ESSXSOF jack monitor is not configured for playback")
+    mode = int(command("sysctl", "-n", "dev.essxsof.0.output_mode"))
+    if mode not in PORTS:
+        raise AudioError("Unknown physical output mode")
+    status = command("essxsofctl", "status")
+    match = re.search(r"^PCM: (/dev/dsp[0-9]+)$", status, re.MULTILINE)
+    if not match:
+        raise AudioError("Cannot locate the ESSXSOF OSS playback device")
+    return mode, match.group(1)
+
+class Manager:
+    def __init__(self, folder=None):
+        base = Path(os.environ.get("XDG_STATE_HOME", str(Path.home()/".local/state")))
+        self.path = Path(folder) if folder else base / "essx-desktop"
+        self.session = self.path / "session.json"
+        self.prefs = self.path / "preferences.json"
+        self.stopfile = self.path / "stop-request"
+        self.lock = self.path / "monitor.lock"
+
+    def prepare(self):
+        if self.path.is_symlink():
+            raise AudioError("Refusing a symbolic-link state directory")
+        self.path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.path.chmod(0o700)
+
+    def read(self, path, fallback=None):
+        if not path.exists():
+            return fallback if fallback is not None else {}
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def write(self, path, data):
+        self.prepare()
+        temp = path.with_name(path.name + ".new")
+        temp.write_text(json.dumps(data, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+        temp.chmod(0o600)
+        temp.replace(path)
+
+    def owns(self, entry, live, name):
+        try:
+            number = int(entry["id"])
+            return (number in live and live[number][0] == name and
+                    all(s in module_args(live[number][1]) for s in entry["args"]
+                        if s.startswith(("sink_name=", "master=", "device="))))
+        except (ValueError, TypeError, KeyError):
+            return False
+
+    def valid(self, state):
+        if state.get("profile") != PROFILE or len(state.get("ports", [])) != 2:
+            return False
+        live = modules()
+        available = sinks()
+        for i in PORTS:
+            entry = state["ports"][i]
+            if not self.owns(entry, live, "module-virtual-sink"):
+                return False
+            if PORTS[i] not in available or sink_owner(available[PORTS[i]]) != int(entry["id"]):
+                return False
+        backend = state.get("backend")
+        if backend is not None:
+            if not self.owns(backend, live, "module-oss"):
+                return False
+            if BACKEND not in available or sink_owner(available[BACKEND]) != int(backend["id"]):
+                return False
+        return BACKEND in available
+
+    def create(self):
+        existing = sinks()
+        if self.session.exists():
+            old = self.read(self.session)
+            if self.valid(old):
+                return old
+            if any(port in existing for port in PORTS.values()):
+                raise AudioError("Existing profile ownership is unclear; refusing to replace it")
+            if old.get("backend") and BACKEND in existing:
+                raise AudioError("Existing backend ownership is unclear; refusing to replace it")
+            self.session.unlink()  # Stale PulseAudio module IDs must not be unloaded.
+        mode, dsp = hardware()
+        if any(port in existing for port in PORTS.values()):
+            raise AudioError("Old ESSXSOF port modules are still loaded; stop previous preview")
+        if "essx_volume_200" in existing:
+            raise AudioError("Legacy Software 200 output is active; run the provided upgrade script")
+        default = pa("get-default-sink")
+        state = {"profile": PROFILE, "backend": None, "ports": [], "current": mode,
+                 "old_default": default, "dsp": dsp}
+        self.write(self.session, state)
+        try:
+            if BACKEND not in existing:
+                args = ["sink_name=" + BACKEND, "device=" + dsp, "record=no", "playback=yes",
+                        "rate=48000", "format=s16le", "channels=2", "fragments=4",
+                        "fragment_size=2048", "mmap=no"]
+                number = int(pa("load-module", "module-oss", *args))
+                state["backend"] = {"id": number, "args": args}
+                self.write(self.session, state)
+            else:
+                raise AudioError("Unmanaged ESSXSOF backend remains; run upgrade script")
+            pref = self.read(self.prefs, {"volumes": {"0": 85, "1": 70}})
+            volumes = pref.get("volumes", {"0": 85, "1": 70})
+            for i in PORTS:
+                # sink_properties is supported by module-virtual-sink; using an
+                # underscore-safe value works on older FreeBSD pactl versions.
+                args = ["sink_name=" + PORTS[i], "master=" + BACKEND,
+                        "use_volume_sharing=no",
+                        "sink_properties=device.description=ESSXSOF_" + ("Speakers" if i == 0 else "Headphones")]
+                try:
+                    number = int(pa("load-module", "module-virtual-sink", *args))
+                except AudioError:
+                    # Compatibility fallback: proven Preview 2 argument set.
+                    args = args[:3]
+                    number = int(pa("load-module", "module-virtual-sink", *args))
+                state["ports"].append({"id": number, "args": args})
+                self.write(self.session, state)
+                level = max(0, min(100, int(volumes.get(str(i), DEFAULT_LEVELS[i]))))
+                pa("set-sink-volume", PORTS[i], str(level) + "%")
+                pa("set-sink-mute", PORTS[i], "0" if i == mode else "1")
+            pa("set-sink-volume", BACKEND, "100%")
+            pa("set-sink-mute", BACKEND, "0")
+            # Preserve explicitly selected USB/HDMI, but take over the former
+            # ES8336 physical alias as the application's default.
+            if re.fullmatch(r"oss_output\.dsp" + re.escape(dsp.rsplit("dsp", 1)[1]) + r"(?:\.[0-9]+)?", default) or default.startswith("essx_") or default == "auto_null":
+                pa("set-default-sink", PORTS[mode])
+                self.migrate_streams([default], PORTS[mode])
+            return state
+        except Exception:
+            try:
+                self.restore(state)
+            except Exception as ex:
+                print("Rollback incomplete:", ex, file=sys.stderr)
+            raise
+
+    def migrate_streams(self, source_names, target):
+        available = sinks()
+        ids = {int(available[n]["index"]) for n in source_names if n in available}
+        if not ids:
+            return
+        owned = {sink_owner(available[p]) for p in PORTS.values() if p in available}
+        for stream in json_list("sink-inputs"):
+            if int(stream.get("sink", -1)) in ids and (stream.get("owner_module") is None or int(stream["owner_module"]) not in owned):
+                pa("move-sink-input", str(stream["index"]), target)
+
+    def switch(self, state, mode):
+        if mode == state["current"]:
+            return
+        old, new = PORTS[state["current"]], PORTS[mode]
+        available = sinks()
+        if old not in available or new not in available:
+            raise AudioError("A managed output has disappeared")
+        pa("set-sink-mute", old, "1")
+        pa("set-sink-mute", new, "0")
+        if pa("get-default-sink") == old:
+            pa("set-default-sink", new)
+        self.migrate_streams([old], new)
+        state["current"] = mode
+        self.write(self.session, state)
+        print("Output:", LABELS[mode], flush=True)
+
+    def save_volumes(self):
+        s = sinks()
+        data = self.read(self.prefs, {"volumes": {"0": 85, "1": 70}, "cleanup": False})
+        data.setdefault("volumes", {})
+        changed = False
+        for i in PORTS:
+            if PORTS[i] in s:
+                level = volume_percent(s[PORTS[i]])
+                if level is not None and 0 <= level <= 100 and data["volumes"].get(str(i)) != level:
+                    data["volumes"][str(i)] = level
+                    changed = True
+        if changed:
+            self.write(self.prefs, data)
+
+    def cleanup(self, apply=False, quiet=False):
+        """Remove only currently identifiable duplicate ESSXSOF playback OSS sinks.
+
+        PulseAudio's FreeBSD devd detector may unload/recreate modules during
+        this operation. Never use an old module ID without revalidating it, and
+        do not treat disappearance of a duplicate as a failed installation.
+        """
+        mode, dsp = hardware()
+        active = sinks()
+        live = modules()
+        source_list = json_list("sources")
+        candidates = []
+        for name, item in active.items():
+            if not name.startswith("oss_output.dsp"):
+                continue
+            idx = sink_owner(item)
+            kind, args = live.get(idx, (None, ""))
+            if kind != "module-oss" or idx < 0:
+                continue
+            try:
+                params = module_args(args)
+            except ValueError:
+                continue
+            if "device=" + dsp not in params:
+                continue
+            capture = [src for src in source_list if sink_owner(src) == idx and
+                       not str(src.get("name", "")).endswith(".monitor")]
+            if capture:
+                print(f"PRESERVED {name}: module {idx} also owns a recording source")
+                continue
+            candidates.append((idx, name))
+        if not candidates:
+            if not quiet:
+                print("No safe duplicate ESSXSOF OSS outputs found")
+            return 0
+
+        removed = 0
+        for mid, name in candidates:
+            if not apply:
+                print(f"WOULD REMOVE module {mid}: {name} ({dsp})")
+                continue
+            # Re-check the sink, module, and capture ownership immediately.
+            # A FreeBSD devd notification can cause automatic module churn.
+            fresh = sinks()
+            current = fresh.get(name)
+            latest = modules()
+            kind, args = latest.get(mid, (None, ""))
+            try:
+                same_device = "device=" + dsp in module_args(args)
+            except ValueError:
+                same_device = False
+            if not current or sink_owner(current) != mid or kind != "module-oss" or not same_device:
+                print(f"SKIP module {mid}: {name} changed or disappeared during cleanup")
+                continue
+            latest_sources = json_list("sources")
+            if any(sink_owner(src) == mid and not str(src.get("name", "")).endswith(".monitor")
+                   for src in latest_sources):
+                print(f"PRESERVED module {mid}: a capture source appeared")
+                continue
+            if PORTS[mode] not in fresh:
+                raise AudioError("Managed outputs must be active before cleanup")
+            self.migrate_streams([name], PORTS[mode])
+            # Stream migration may itself trigger a PulseAudio module change.
+            final_sinks = sinks()
+            final_modules = modules()
+            final_kind, final_args = final_modules.get(mid, (None, ""))
+            try:
+                final_device_ok = "device=" + dsp in module_args(final_args)
+            except ValueError:
+                final_device_ok = False
+            if (name not in final_sinks or sink_owner(final_sinks[name]) != mid or
+                final_kind != "module-oss" or not final_device_ok or
+                any(sink_owner(src) == mid and not str(src.get("name", "")).endswith(".monitor")
+                    for src in json_list("sources"))):
+                print(f"SKIP module {mid}: {name} changed during stream migration")
+                continue
+            print(f"REMOVE module {mid}: {name} ({dsp})")
+            try:
+                pa("unload-module", str(mid))
+            except AudioError:
+                # If PulseAudio removed the module itself, that's fine. Do not
+                # suppress genuine unload failures where the same module remains.
+                if mid in modules():
+                    raise
+                print(f"SKIP module {mid}: already unloaded by PulseAudio")
+                continue
+            removed += 1
+
+        if apply:
+            prefs = self.read(self.prefs, {"volumes": {"0": 85, "1": 70}})
+            prefs["cleanup"] = True
+            self.write(self.prefs, prefs)
+            # Report only remaining outputs for this same physical OSS device.
+            # Other /dev/dsp devices (such as a USB sound interface) are not
+            # duplicates and should never be described as cleanup leftovers.
+            after = sinks()
+            after_modules = modules()
+            leftover = []
+            for name, item in after.items():
+                if not name.startswith("oss_output.dsp"):
+                    continue
+                kind, args = after_modules.get(sink_owner(item), (None, ""))
+                try:
+                    if kind == "module-oss" and "device=" + dsp in module_args(args):
+                        leftover.append(name)
+                except ValueError:
+                    pass
+            if leftover and not quiet:
+                print("NOTE: automatically detected ESSXSOF OSS outputs remain:", ", ".join(leftover))
+                print("Run 'essx-desktop doctor' for a read-only report; unrelated devices are preserved")
+        return removed if apply else len(candidates)
+
+    def restore(self, state):
+        live = modules()
+        active = sinks()
+        owned = set()
+        for entry in state.get("ports", []):
+            if self.owns(entry, live, "module-virtual-sink"):
+                owned.add(int(entry["id"]))
+        backend = state.get("backend")
+        if backend and self.owns(backend, live, "module-oss"):
+            owned.add(int(backend["id"]))
+        for name in PORTS.values():
+            if name in active and sink_owner(active[name]) not in owned:
+                raise AudioError(f"Output {name} ownership changed; keeping audio untouched")
+        # If duplicate cleanup removed every auto-detected OSS sink, recreate a
+        # safe basic fallback BEFORE unloading our backend. This ensures the
+        # desktop-only uninstall never leaves the user without a PulseAudio sink.
+        backend = state.get("backend")
+        if backend and int(backend["id"]) in owned and not any(
+                re.fullmatch(r"oss_output\.dsp" + re.escape(state["dsp"].rsplit("dsp", 1)[1]) + r"(?:\.[0-9]+)?", n) for n in active):
+            dsp = state.get("dsp", "/dev/dsp0")
+            if not re.fullmatch(r"/dev/dsp[0-9]+", dsp):
+                raise AudioError("Invalid OSS device in saved session")
+            pa("load-module", "module-oss", "device=" + dsp, "record=no", "playback=yes")
+            active = sinks()
+        target = state.get("old_default")
+        if target not in active or target in PORTS.values():
+            target = BACKEND if BACKEND in active else next(
+                (name for name in active if re.fullmatch(r"oss_output\.dsp" + re.escape(state["dsp"].rsplit("dsp", 1)[1]) + r"(?:\.[0-9]+)?", name)), None)
+        if target == BACKEND and backend and int(backend["id"]) in owned:
+            target = next((n for n in active if re.fullmatch(r"oss_output\.dsp" + re.escape(state["dsp"].rsplit("dsp", 1)[1]) + r"(?:\.[0-9]+)?", n)), None)
+        if target:
+            self.migrate_streams(list(PORTS.values()), target)
+            if pa("get-default-sink") in PORTS.values():
+                pa("set-default-sink", target)
+        for entry in reversed(state.get("ports", [])):
+            if int(entry["id"]) in owned:
+                pa("unload-module", str(entry["id"]))
+        if backend and int(backend["id"]) in owned:
+            pa("unload-module", str(backend["id"]))
+        self.session.unlink(missing_ok=True)
+
+    def monitor(self, wait=False):
+        self.prepare()
+        with self.lock.open("a+") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise AudioError("ESSXSOF desktop monitor is already running")
+            self.stopfile.unlink(missing_ok=True)
+            if wait:
+                # Graphical login may precede the late rc.d jack retry AND
+                # PulseAudio may start after XDG autostart applications.
+                last_error = "not ready"
+                for _ in range(90):
+                    if self.stopfile.exists():
+                        raise AudioError("Startup cancelled")
+                    try:
+                        hardware()
+                        pa("info")
+                        break
+                    except (AudioError, OSError, subprocess.TimeoutExpired) as exc:
+                        last_error = str(exc)
+                        time.sleep(1)
+                else:
+                    raise AudioError("Audio startup timed out: " + last_error)
+            state = self.create()
+            stopping = False
+            def on_stop(*_):
+                nonlocal stopping
+                stopping = True
+            signal.signal(signal.SIGINT, on_stop)
+            signal.signal(signal.SIGTERM, on_stop)
+            failures = 0
+            last_volume, last_cleanup = 0.0, 0.0
+            print("ESSXSOF desktop profiles ready", flush=True)
+            try:
+                while not stopping and not self.stopfile.exists():
+                    try:
+                        if not self.valid(state):
+                            raise AudioError("PulseAudio server or profile ownership changed")
+                        mode, _ = hardware()
+                        self.switch(state, mode)
+                        now = time.monotonic()
+                        if now - last_volume > 3:
+                            self.save_volumes()
+                            last_volume = now
+                        if now - last_cleanup > 12 and self.read(self.prefs, {}).get("cleanup"):
+                            self.cleanup(apply=True, quiet=True)
+                            last_cleanup = now
+                        failures = 0
+                    except (AudioError, OSError, ValueError, KeyError) as ex:
+                        failures += 1
+                        if failures in (1, 5):
+                            print("Monitor warning:", ex, file=sys.stderr, flush=True)
+                        if failures >= 5:
+                            break
+                    time.sleep(0.75)
+            finally:
+                try:
+                    if self.valid(state):
+                        self.save_volumes()
+                        self.restore(state)
+                    else:
+                        print("State changed; refusing to unload unknown modules", file=sys.stderr)
+                except Exception as ex:
+                    print("Shutdown warning:", ex, file=sys.stderr)
+                self.stopfile.unlink(missing_ok=True)
+
+    def stop(self):
+        self.prepare()
+        with self.lock.open("a+") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                self.stopfile.touch()
+                for _ in range(50):
+                    time.sleep(.2)
+                    try:
+                        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        pass
+                else:
+                    raise AudioError("Monitor has not exited; nothing else was removed")
+            if self.session.exists():
+                state = self.read(self.session)
+                if self.valid(state):
+                    self.save_volumes()
+                    self.restore(state)
+                elif all(n not in sinks() for n in PORTS.values()) and BACKEND not in sinks():
+                    self.session.unlink()
+                else:
+                    raise AudioError("Unexpected PulseAudio state; preserving modules")
+            self.stopfile.unlink(missing_ok=True)
+
+    def status(self):
+        print("ESSXSOF Desktop", VERSION)
+        try:
+            mode, dsp = hardware()
+            print("Physical device:", dsp, "| routed to:", LABELS[mode])
+        except AudioError as ex:
+            mode = -1
+            print("Driver warning:", ex)
+        active = sinks()
+        for i in PORTS:
+            item = active.get(PORTS[i])
+            print(f"{LABELS[i]}:", f"{volume_percent(item)}%" if item else "not loaded",
+                  "(active)" if item and i == mode else "")
+        print("Default sink:", pa("get-default-sink"))
+        print("Other visible outputs:", ", ".join(n for n in active if n not in PORTS.values()))
+        print("Session state:", "present" if self.session.exists() else "absent")
+        try:
+            print("Jack monitor admission:", command("sysctl", "-n", "dev.essxsof.0.jack_bias_playback"))
+        except AudioError as exc:
+            print("Jack monitor admission: unavailable:", exc)
+
+    def doctor(self):
+        print("ESSXSOF desktop diagnostics (read-only)")
+        for label, fn in [
+            ("driver", lambda: command("sysctl", "-n", "dev.essxsof.0.driver_version")),
+            ("jack bias", lambda: command("sysctl", "-n", "dev.essxsof.0.jack_bias_playback")),
+            ("output mode", lambda: command("sysctl", "-n", "dev.essxsof.0.output_mode")),
+            ("default sink", lambda: pa("get-default-sink")),
+            ("outputs", lambda: ", ".join(sinks().keys())),
+        ]:
+            try:
+                print(label + ":", fn())
+            except AudioError as ex:
+                print(label + ": ERROR:", ex)
+        self.cleanup(apply=False)
+
+def install():
+    if not sys.platform.startswith("freebsd") or os.geteuid() == 0:
+        raise AudioError("Run as a regular desktop user on FreeBSD")
+    hardware()
+    target = Path.home() / ".local/bin/essx-desktop"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists() and "ESSXSOF user-session audio profiles" not in target.read_text(encoding="utf-8"):
+        raise AudioError("Refusing to overwrite an unrelated essx-desktop executable")
+    if Path(__file__).resolve() != target.resolve():
+        shutil.copyfile(__file__, target)
+    target.chmod(0o755)
+    startup = Path.home() / ".config/autostart/essx-desktop.desktop"
+    startup.parent.mkdir(parents=True, exist_ok=True)
+    if startup.exists() and "X-Essx-Desktop=true" not in startup.read_text(encoding="utf-8"):
+        raise AudioError("Refusing to replace an unrelated desktop autostart file")
+    exe = shlex.quote(sys.executable)
+    path = str(target).replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%')
+    startup.write_text('[Desktop Entry]\nType=Application\nName=ESSXSOF Audio Outputs\n'
+                       'Exec=' + exe + ' "' + path + '" run --startup-wait\n'
+                       'Terminal=false\nX-Essx-Desktop=true\n', encoding="utf-8")
+    print("Installed:", target)
+    print("Autostart installed. Kernel driver unchanged.")
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=["install", "start", "run", "stop", "remove", "doctor",
+                                           "status", "cleanup", "volume", "report"])
+    parser.add_argument("port", nargs="?", choices=["speaker", "headphone"])
+    parser.add_argument("percent", type=int, nargs="?")
+    parser.add_argument("--apply", action="store_true", help="Apply exact-match duplicate OSS cleanup")
+    parser.add_argument("--startup-wait", action="store_true", help="Wait for the kernel service at login")
+    a = parser.parse_args()
+    if os.geteuid() == 0:
+        raise AudioError("Never run this desktop tool as root")
+    m = Manager()
+    if a.action == "install":
+        install()
+    elif a.action == "run":
+        m.monitor(wait=a.startup_wait)
+    elif a.action == "start":
+        m.prepare()
+        if m.session.exists() and m.valid(m.read(m.session)):
+            print("Profiles are already active")
+            return
+        dest = Path.home() / ".local/bin/essx-desktop"
+        if not dest.exists():
+            raise AudioError("Run desktop upgrade first")
+        with (m.path / "monitor.log").open("a", encoding="utf-8") as log:
+            subprocess.Popen([sys.executable, str(dest), "run"], stdin=subprocess.DEVNULL,
+                             stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+                             close_fds=True)
+        for _ in range(25):
+            time.sleep(.2)
+            if m.session.exists() and m.valid(m.read(m.session)):
+                print("ESSXSOF desktop profiles are active")
+                return
+        raise AudioError("Startup failed; check " + str(m.path / "monitor.log"))
+    elif a.action == "stop":
+        m.stop()
+        print("Desktop profiles stopped; kernel audio was not changed")
+    elif a.action == "remove":
+        m.stop()
+        startup = Path.home() / ".config/autostart/essx-desktop.desktop"
+        if startup.exists() and "X-Essx-Desktop=true" in startup.read_text(encoding="utf-8"):
+            startup.unlink()
+        target = Path.home() / ".local/bin/essx-desktop"
+        if target.exists() and "ESSXSOF user-session audio profiles" in target.read_text(encoding="utf-8"):
+            target.unlink()
+        print("Desktop layer uninstalled; kernel audio unchanged")
+    elif a.action == "doctor":
+        m.doctor()
+    elif a.action == "status":
+        m.status()
+    elif a.action == "cleanup":
+        m.cleanup(apply=a.apply)
+    elif a.action == "volume":
+        if a.port is None or a.percent is None or not 0 <= a.percent <= 100:
+            raise AudioError("Usage: essx-desktop volume speaker|headphone 0..100")
+        i = 0 if a.port == "speaker" else 1
+        if PORTS[i] not in sinks():
+            raise AudioError("Output profile is not loaded")
+        pa("set-sink-volume", PORTS[i], str(a.percent) + "%")
+        pref = m.read(m.prefs, {"volumes": {"0": 85, "1": 70}})
+        pref.setdefault("volumes", {})[str(i)] = a.percent
+        m.write(m.prefs, pref)
+        print(LABELS[i], str(a.percent) + "%")
+    elif a.action == "report":
+        m.doctor()
+        print("PulseAudio modules:")
+        print(pa("list", "short", "modules"))
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (AudioError, OSError, ValueError, KeyError, json.JSONDecodeError,
+            subprocess.TimeoutExpired, TypeError) as exc:
+        print("essx-desktop:", exc, file=sys.stderr)
+        sys.exit(1)

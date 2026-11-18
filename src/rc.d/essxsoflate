@@ -1,0 +1,20 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+# PROVIDE: essxsoflate
+# REQUIRE: LOGIN essxsof
+# KEYWORD: nojail
+# Retry the jack monitor after the early kernel/audio startup phase.
+# Safe/idempotent: essxsofctl start keeps a running kernel module and mixer.
+. /etc/rc.subr
+name=essxsoflate
+rcvar=essxsof_enable
+start_cmd=essxsoflate_start
+stop_cmd=:
+essxsoflate_start() {
+    [ -x /usr/local/sbin/essxsofctl ] || return 0
+    [ "$(sysctl -n dev.essxsof.0.pcm_enable 2>/dev/null || :)" = 1 ] || return 0
+    /usr/local/sbin/essxsofctl start
+}
+load_rc_config essxsof
+: "${essxsof_enable:=NO}"
+run_rc_command "$1"

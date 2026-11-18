@@ -19,7 +19,7 @@ cp essxsof.ko out/essxsof.ko
 cp firmware-module/essx8336_sof.ko out/essx8336_sof.ko
 cp pcm-test out/pcm-test
 {
-    echo 'driver_version=0.19.0-rc1'
+    echo 'driver_version=0.20.0-rc1'
     echo "kernel_osreldate=$running"
     echo "source_osreldate=$source_version"
     echo 'machine=amd64'
